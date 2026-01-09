@@ -1,172 +1,201 @@
-Graph-Based Representations of Motor Behavior Improve Machine Learning Prediction of Attention-Deficit/Hyperactivity Disorder
 
+
+<h1>Graph-Based Representations of Motor Behavior Improve Machine Learning Prediction of Attention-Deficit/Hyperactivity Disorder</h1>
+
+<p>
 This repository accompanies the study:
+</p>
 
+<p><strong>
 “Graph-Based Representations of Motor Behavior Improve Machine Learning Prediction of Attention-Deficit/Hyperactivity Disorder”
+</strong></p>
 
-It provides a fully reproducible pipeline for comparing raw feature–based machine learning with knowledge graph–based representations derived from the same movement data, under a controlled experimental design.
+<p>
+It provides a fully reproducible pipeline for comparing <strong>raw feature–based machine learning</strong>
+with <strong>knowledge graph–based representations</strong> derived from the <em>same motor behavior data</em>,
+under a strictly controlled experimental design.
+</p>
 
-The central goal is to isolate the effect of data representation on classification performance, while keeping:
-	•	the feature set,
-	•	the machine learning model,
-	•	and the evaluation protocol
-strictly constant.
+<p>
+The central goal of this work is to <strong>isolate the effect of data representation on classification performance</strong>,
+while keeping the following components constant across all experiments:
+</p>
 
-⸻
+<ul>
+    <li>the feature set,</li>
+    <li>the machine learning model,</li>
+    <li>and the evaluation protocol.</li>
+</ul>
 
-Overview of the Approach
+<h2>Overview of the Approach</h2>
 
-The project implements two alternative representations of the same motor behavior data:
-	1.	Raw feature representation
-Movement-derived descriptors (entropy, variability, complexity) are treated as independent numerical inputs to a machine learning classifier.
-	2.	Graph-based representation (Expert Knowledge Graph)
-The same features are reorganized into a subject–feature knowledge graph.
-Subject embeddings are learned using Node2Vec, encoding relational and semantic structure among participants.
+<p>The project implements two alternative representations of the same motor behavior data:</p>
 
-A single machine learning model (logistic regression) is trained and evaluated on:
-	•	raw features,
-	•	graph embeddings,
-	•	and their concatenation.
+<h3>1. Raw Feature Representation</h3>
+<p>
+Movement-derived descriptors (e.g., entropy, variability, complexity) are treated as
+<strong>independent numerical inputs</strong> to a machine learning classifier.
+</p>
 
-Performance differences therefore reflect representation alone, not algorithmic changes.
+<h3>2. Graph-Based Representation (Expert Knowledge Graph)</h3>
+<p>
+The same features are reorganized into a <strong>subject–feature knowledge graph</strong>.
+Subject embeddings are learned using <strong>Node2Vec</strong>, encoding relational and semantic
+structure among participants.
+</p>
 
-Graph Based Representations of Motor Behavior Improve Machine Learning Prediction of Attention/
-├── baseline_ml/        # Raw feature-based ML pipeline
-├── kg/                 # Knowledge graph construction and embedding
-├── scripts/            # Shared utilities and analysis scripts
-├── results/            # Saved outputs (AUCs, embeddings, permutation importance)
-├── data/               # Input data (if permitted to share)
-├── requirements.txt    # Python dependencies
-├── README.md           # This file
-└── manuscript.tex      # LaTeX manuscript (optional)
+<p>
+A single machine learning model (<strong>logistic regression</strong>) is trained and evaluated on:
+</p>
 
-Requirements
-	•	Python ≥ 3.9
-	•	Recommended: virtual environment
+<ul>
+    <li>raw features,</li>
+    <li>graph embeddings,</li>
+    <li>and their direct concatenation.</li>
+</ul>
 
-Install dependencies:
-pip install -r requirements.txt
+<p>
+Performance differences therefore reflect <strong>representation alone</strong>, not changes in
+algorithms, features, or tuning.
+</p>
 
-Data
+<h2>Repository Structure</h2>
 
-The pipeline assumes movement-derived features already computed from actigraphy or IMU-like acceleration signals.
+<div class="tree">
+Graph Based Representations of Motor Behavior Improve Machine Learning Prediction of Attention/<br>
+├── baseline_ml/ &nbsp;&nbsp;&nbsp;# Raw feature-based ML pipeline<br>
+├── kg/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# Knowledge graph construction and embeddings<br>
+├── scripts/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# Shared utilities and analysis scripts<br>
+├── results/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# Outputs (AUCs, embeddings, permutation importance)<br>
+├── data/ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# Input data (if permitted to share)<br>
+├── requirements.txt # Python dependencies<br>
+├── README.md &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# This file<br>
+└── manuscript.tex &nbsp;# LaTeX manuscript (optional)
+</div>
 
-Feature types include:
-	•	entropy-based measures,
-	•	complexity measures (e.g., Lempel–Ziv),
-	•	variability descriptors.
+<h2>Requirements</h2>
 
-The file features_complete.txt documents the full feature set used in the study.
+<ul>
+    <li>Python ≥ 3.9</li>
+    <li>Virtual environment recommended</li>
+</ul>
 
-Important:
-No additional variables are introduced at any stage of the graph-based analysis.
+<pre>pip install -r requirements.txt</pre>
 
-⸻
+<h2>Data</h2>
 
-Step-by-Step Reproducibility Guide
+<p>
+The pipeline assumes that movement-derived features have already been computed from
+actigraphy or IMU-like acceleration signals.
+</p>
 
-1. Raw Feature-Based Machine Learning (Baseline)
+<p>Feature types include:</p>
 
-Located in: baseline_ml/
+<ul>
+    <li>entropy-based measures,</li>
+    <li>complexity measures (e.g., Lempel–Ziv),</li>
+    <li>variability descriptors.</li>
+</ul>
 
-This stage evaluates conventional ML using flat feature representations.
+<p>
+The file <code>features_complete.txt</code> documents the full feature set used in the study.
+</p>
 
-Main script:
-python bench_raw_ml.py
+<div class="note">
+<strong>Important:</strong> No additional variables are introduced at any stage of the graph-based analysis.
+</div>
 
-What it does:
-	•	Loads raw movement features
-	•	Trains a logistic regression classifier
-	•	Uses stratified 5-fold cross-validation
-	•	Reports ROC–AUC performance
+<h2>Step-by-Step Reproducibility Guide</h2>
 
-Additional evaluation:
+<h3>1. Raw Feature-Based Machine Learning (Baseline)</h3>
+
+<p><strong>Location:</strong> <code>baseline_ml/</code></p>
+
+<pre>python bench_raw_ml.py</pre>
+
+<p>
+This script:
+</p>
+
+<ul>
+    <li>loads raw movement features,</li>
+    <li>trains a logistic regression classifier,</li>
+    <li>uses stratified 5-fold cross-validation,</li>
+    <li>reports ROC–AUC performance.</li>
+</ul>
+
+<p>Additional evaluation:</p>
+
+<pre>
 python benchmark_auc.py
 python permutation_importance_lr.py
+</pre>
 
-Outputs:
-	•	Mean and fold-wise AUC scores
-	•	Permutation-based feature importance (perm_importance_raw.csv)
-2. Knowledge Graph Construction
+<h3>2. Knowledge Graph Construction</h3>
 
-Located in: kg/
+<p><strong>Location:</strong> <code>kg/</code></p>
 
-This stage reorganizes the same features into a relational structure.
-
-Key steps:
+<pre>
 python build_expert_kg.py
 python add_similarity_layer.py
+</pre>
 
-What happens:
-	•	Subjects and features are represented as nodes
-	•	Subject–feature relationships are encoded
-	•	Subject–subject similarity edges are added using entropy and complexity descriptors
-	•	No new measurements are created
+<p>
+Subjects and features are represented as nodes. Subject–subject similarity edges are
+constructed using entropy- and complexity-based descriptors. No new measurements are created.
+</p>
 
-The graph structure is saved for downstream embedding.
-python run_node2vec.py
+<h3>3. Graph Embedding (Node2Vec)</h3>
 
-This step:
-	•	Applies Node2Vec to the subject graph
-	•	Produces low-dimensional subject embeddings
-	•	Preserves neighborhood and relational structure
+<pre>python run_node2vec.py</pre>
 
-Output:
-expertkg_node2vec_patient_embeddings.csv
+<p>
+This produces low-dimensional subject embeddings that preserve relational structure.
+</p>
 
-4. Machine Learning on Graph Embeddings
-   python export_expert_kg_embeddings.py
-   python benchmark_auc.py
+<h3>4. Machine Learning on Graph Embeddings</h3>
 
-This evaluates the same ML model using graph embeddings as input.
+<pre>
+python export_expert_kg_embeddings.py
+python benchmark_auc.py
+</pre>
 
-Outputs:
-	•	ROC–AUC scores for the graph-based representation
-	•	Permutation importance for embedding dimensions (perm_importance_emb.csv)
+<h3>5. Combined Representation (Optional)</h3>
 
-5. Combined Representation (Optional)
+<pre>python permutation_importance_lr.py</pre>
 
-Raw features and embeddings are concatenated:
-python permutation_importance_lr.py
-This tests whether naïve feature fusion improves performance.
+<p>
+This evaluates whether concatenating raw features and embeddings improves performance.
+</p>
 
-Results show:
-	•	intermediate performance,
-	•	partial redundancy between representations,
-	•	no systematic additive gain.
-Results Directory
+<h2>Key Design Principles</h2>
 
-The results/ folder contains:
-	•	Cross-validation AUC results
-	•	Learned graph embeddings
-	•	Permutation importance analyses
-	•	Intermediate graph objects
+<ul>
+    <li><strong>Same ML model everywhere:</strong> logistic regression</li>
+    <li><strong>Same features everywhere:</strong> graphs built from raw features</li>
+    <li><strong>Same evaluation protocol:</strong> stratified 5-fold cross-validation</li>
+    <li><strong>No hidden tuning advantages:</strong> representation is the only difference</li>
+</ul>
 
-These files are directly referenced in the manuscript.
+<h2>Intended Use</h2>
 
-⸻
+<p>
+This repository is intended for reproducibility, methodological comparison of
+representation strategies, and extension to other movement or clinical datasets.
+</p>
 
-Key Design Principles
-	•	Same ML model everywhere
-Logistic regression is used consistently.
-	•	Same features everywhere
-Graphs are built from the raw features, not in addition to them.
-	•	Same evaluation protocol
-Stratified 5-fold cross-validation for all experiments.
-	•	No hidden tuning advantages
-Differences arise solely from representation.
+<p><strong>It is not intended as a diagnostic tool.</strong></p>
 
-⸻
+<h2>Citation</h2>
 
-Intended Use
-
-This repository is intended for:
-	•	reproducibility of the published results,
-	•	methodological comparison of representation strategies,
-	•	extension to other movement or clinical datasets.
-
-It is not intended as a diagnostic tool.
-
-Citation
-
+<p>
 If you use this code, please cite the accompanying paper.
+</p>
+
+<footer>
+<hr>
+<p>Maintained for research and reproducibility purposes.</p>
+</footer>
+
+</body>
+</html>
