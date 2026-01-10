@@ -76,7 +76,12 @@ def expert_mapping(feature_name: str) -> tuple[str, str, str]:
     return prop, beh, tmp
 
 
-def align_inputs(features: pd.DataFrame, patient: pd.DataFrame, label_column: str) -> tuple[pd.DataFrame, pd.Series]:
+def align_inputs(
+    features: pd.DataFrame,
+    patient: pd.DataFrame,
+    label_column: str,
+    positive_label_value: int,
+) -> tuple[pd.DataFrame, pd.Series]:
     for df in (features, patient):
         df.columns = [c.strip() for c in df.columns]
 
@@ -91,9 +96,18 @@ def align_inputs(features: pd.DataFrame, patient: pd.DataFrame, label_column: st
     if "filter_$" in patient.columns:
         patient = patient[patient["filter_$"] == 1].copy()
 
-    patient[label_column] = pd.to_numeric(patient[label_column], errors="coerce")
+    label_raw = patient[label_column]
+    if label_raw.dtype == object:
+        label_norm = label_raw.astype(str).str.strip().str.upper()
+        if set(label_norm.dropna().unique()).issubset({"A", "T"}):
+            patient[label_column] = label_norm.map({"A": 1, "T": 0})
+        else:
+            patient[label_column] = pd.to_numeric(label_raw, errors="coerce")
+    else:
+        patient[label_column] = pd.to_numeric(label_raw, errors="coerce")
+
     patient = patient.dropna(subset=[label_column])
-    patient[label_column] = patient[label_column].astype(int)
+    patient[label_column] = (patient[label_column].astype(float) == float(positive_label_value)).astype(int)
 
     features["ID"] = pd.to_numeric(features["ID"], errors="coerce").astype("Int64")
     patient["ID"] = pd.to_numeric(patient["ID"], errors="coerce").astype("Int64")
@@ -264,7 +278,7 @@ def run(config: Config):
     features = read_csv_auto(config.features_path)
     patient = read_csv_auto(config.patient_path)
 
-    features, labels = align_inputs(features, patient, config.label_column)
+    features, labels = align_inputs(features, patient, config.label_column, config.positive_label_value)
 
     leakage_cols = {
         config.label_column.lower(),
@@ -316,6 +330,7 @@ def run(config: Config):
             "lr_c": config.lr_c,
             "lr_solver": config.lr_solver,
             "lr_max_iter": config.lr_max_iter,
+            "positive_label_value": config.positive_label_value,
         },
     )
 
@@ -697,6 +712,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated list of k values for kNN sensitivity (e.g., 3,5,10).",
     )
     parser.add_argument("--label-column", default=CONFIG.label_column, help="Label column in patient_info.csv")
+    parser.add_argument(
+        "--positive-label",
+        type=int,
+        default=CONFIG.positive_label_value,
+        help="Value treated as positive class (mapped to 1).",
+    )
     return parser.parse_args()
 
 
@@ -710,6 +731,7 @@ if __name__ == "__main__":
             raw_feature_list=args.raw_feature_list,
             similarity_feature_list=args.similarity_feature_list,
             label_column=args.label_column,
+            positive_label_value=args.positive_label,
             results_dir=args.results_dir,
             random_seed=CONFIG.random_seed,
             k_folds=CONFIG.k_folds,
