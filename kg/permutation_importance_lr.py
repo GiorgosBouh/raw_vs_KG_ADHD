@@ -106,9 +106,7 @@ def _perm_importance_cv(X: np.ndarray, y: np.ndarray, feature_names: list[str], 
     aucs = []
     for fold, (tr, te) in enumerate(skf.split(X, y), start=1):
         clf.fit(X[tr], y[tr])
-        proba = clf.predict_proba(X[te])
-        pos_index = list(clf.named_steps["lr"].classes_).index(1)
-        p = proba[:, pos_index]
+        p = clf.predict_proba(X[te])[:, 1]
         auc = roc_auc_score(y[te], p)
         aucs.append(auc)
 

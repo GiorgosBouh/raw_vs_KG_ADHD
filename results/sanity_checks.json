@@ -1,7 +1,0 @@
-{
-  "raw_auc": 0.4105555555555555,
-  "shuffled_label_auc": 0.43333333333333335,
-  "inverted_label_auc": 0.5894444444444444,
-  "random_label_auc_mean": 0.41944444444444445,
-  "random_label_auc_std": 0.0442704929180812
-}
