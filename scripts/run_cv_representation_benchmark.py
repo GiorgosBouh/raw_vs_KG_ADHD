@@ -80,7 +80,7 @@ def align_inputs(
     features: pd.DataFrame,
     patient: pd.DataFrame,
     label_column: str,
-    positive_label_value: int,
+    positive_label_value: str,
 ) -> tuple[pd.DataFrame, pd.Series]:
     for df in (features, patient):
         df.columns = [c.strip() for c in df.columns]
@@ -97,17 +97,30 @@ def align_inputs(
         patient = patient[patient["filter_$"] == 1].copy()
 
     label_raw = patient[label_column]
+    pos_value = str(positive_label_value).strip().upper()
+
     if label_raw.dtype == object:
         label_norm = label_raw.astype(str).str.strip().str.upper()
         if set(label_norm.dropna().unique()).issubset({"A", "T"}):
-            patient[label_column] = label_norm.map({"A": 1, "T": 0})
+            mapped = label_norm.map({"A": 1, "T": 0})
+            if pos_value in {"A", "T"}:
+                pos_numeric = 1 if pos_value == "A" else 0
+                patient[label_column] = (mapped == pos_numeric).astype(int)
+            else:
+                patient[label_column] = mapped
         else:
             patient[label_column] = pd.to_numeric(label_raw, errors="coerce")
     else:
         patient[label_column] = pd.to_numeric(label_raw, errors="coerce")
 
     patient = patient.dropna(subset=[label_column])
-    patient[label_column] = (patient[label_column].astype(float) == float(positive_label_value)).astype(int)
+    try:
+        pos_numeric = float(pos_value)
+    except ValueError:
+        pos_numeric = None
+
+    if pos_numeric is not None:
+        patient[label_column] = (patient[label_column].astype(float) == pos_numeric).astype(int)
 
     features["ID"] = pd.to_numeric(features["ID"], errors="coerce").astype("Int64")
     patient["ID"] = pd.to_numeric(patient["ID"], errors="coerce").astype("Int64")
@@ -714,9 +727,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-column", default=CONFIG.label_column, help="Label column in patient_info.csv")
     parser.add_argument(
         "--positive-label",
-        type=int,
         default=CONFIG.positive_label_value,
-        help="Value treated as positive class (mapped to 1).",
+        help="Value treated as positive class (mapped to 1). Accepts numbers or strings like 'A'/'T'.",
     )
     return parser.parse_args()
 
