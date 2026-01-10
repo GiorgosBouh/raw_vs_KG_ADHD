@@ -1,8 +1,8 @@
 {
-  "features_path": "data/raw/Final_dataset_fixed.csv",
+  "features_path": "data/raw/features.csv",
   "patient_path": "data/raw/patient_info.csv",
-  "raw_feature_list": "kg/features_entropy_variability.txt",
-  "similarity_feature_list": "kg/features_entropy_variability.txt",
+  "raw_feature_list": "kg/features_acc_selected.txt",
+  "similarity_feature_list": "kg/features_acc_selected.txt",
   "label_column": "ADHD",
   "results_dir": "results",
   "random_seed": 42,
