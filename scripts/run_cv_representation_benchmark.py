@@ -329,6 +329,7 @@ def run(config: Config):
 
     k_values = list(config.k_nn_values) if config.k_nn_values else [config.k_nn]
     skf = StratifiedKFold(n_splits=config.k_folds, shuffle=True, random_state=config.random_seed)
+    class_balance = np.bincount(y, minlength=2)
     print(
         "Hyperparameters:",
         {
@@ -344,6 +345,7 @@ def run(config: Config):
             "lr_solver": config.lr_solver,
             "lr_max_iter": config.lr_max_iter,
             "positive_label_value": config.positive_label_value,
+            "class_balance": class_balance.tolist(),
         },
     )
 
@@ -704,7 +706,12 @@ def run(config: Config):
     print("\nSanity checks (raw baseline):")
     print(json.dumps(sanity, indent=2))
     if raw_auc < 0.5:
-        print("Warning: raw AUC < 0.5. Verify label encoding and probability direction.")
+        print(
+            "Warning: raw AUC < 0.5. Verify label encoding/positive label orientation "
+            f"(positive_label_value={config.positive_label_value})."
+        )
+    if inverted_auc > raw_auc:
+        print("Note: inverted AUC > raw AUC suggests positive-label orientation mismatch.")
     print("\nSaved outputs to:", results_dir.resolve())
 
 
