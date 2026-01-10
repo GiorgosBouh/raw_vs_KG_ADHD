@@ -8,8 +8,8 @@ from typing import Optional, Sequence
 class Config:
     features_path: str = "data/raw/features.csv"
     patient_path: str = "data/raw/patient_info.csv"
-    raw_feature_list: str = "kg/features_entropy_variability.txt"
-    similarity_feature_list: str = "kg/features_entropy_variability.txt"
+    raw_feature_list: str = "kg/features_acc_selected.txt"
+    similarity_feature_list: str = "kg/features_acc_selected.txt"
     label_column: str = "ADHD"
     results_dir: str = "results"
 

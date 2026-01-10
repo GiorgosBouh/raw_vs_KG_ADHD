@@ -1,5 +1,5 @@
 {
-  "features_path": "data/raw/features.csv",
+  "features_path": "data/raw/Final_dataset_fixed.csv",
   "patient_path": "data/raw/patient_info.csv",
   "raw_feature_list": "kg/features_entropy_variability.txt",
   "similarity_feature_list": "kg/features_entropy_variability.txt",
