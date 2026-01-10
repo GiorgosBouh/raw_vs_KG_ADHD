@@ -60,7 +60,9 @@ def eval_auc(X: np.ndarray, y: np.ndarray, tag: str) -> None:
     aucs = []
     for tr, te in skf.split(X, y):
         clf.fit(X[tr], y[tr])
-        p = clf.predict_proba(X[te])[:, 1]
+        proba = clf.predict_proba(X[te])
+        pos_index = list(clf.named_steps["lr"].classes_).index(1)
+        p = proba[:, pos_index]
         aucs.append(roc_auc_score(y[te], p))
 
     aucs = np.array(aucs, dtype=float)
