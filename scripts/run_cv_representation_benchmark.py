@@ -238,14 +238,6 @@ def project_test_embeddings(
     return projected
 
 
-def proba_positive(model: LogisticRegression, X: np.ndarray, positive_label: int = 1) -> np.ndarray:
-    classes = model.classes_
-    if positive_label not in classes:
-        raise ValueError(f"Positive label {positive_label} not in model classes: {classes}")
-    col_idx = int(np.where(classes == positive_label)[0][0])
-    return model.predict_proba(X)[:, col_idx]
-
-
 def bootstrap_auc(y_true: np.ndarray, y_score: np.ndarray, n_boot: int, seed: int) -> tuple[float, float]:
     rng = np.random.default_rng(seed)
     n = len(y_true)
@@ -414,7 +406,10 @@ def run(config: Config):
                     random_state=config.random_seed,
                 )
                 lr.fit(X_emb_train, y_train)
-                prob = proba_positive(lr, X_emb_test, positive_label=1)
+                proba = lr.predict_proba(X_emb_test)
+                pos_index = list(lr.classes_).index(1)
+                y_score = proba[:, pos_index]
+                prob = y_score
                 auc = roc_auc_score(y_test, prob)
                 if variant == "bipartite" and k_value == config.k_nn_values[0]:
                     auc_bipartite = auc
@@ -460,7 +455,10 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_raw.fit(X_raw_train, y_train)
-        prob_raw = proba_positive(lr_raw, X_raw_test, positive_label=1)
+        proba = lr_raw.predict_proba(X_raw_test)
+        pos_index = list(lr_raw.classes_).index(1)
+        y_score = proba[:, pos_index]
+        prob_raw = y_score
         auc_raw = roc_auc_score(y_test, prob_raw)
         y_train_rand = y_train.copy()
         rng = np.random.default_rng(config.random_seed + fold)
@@ -472,7 +470,10 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_rand.fit(X_raw_train, y_train_rand)
-        prob_rand = proba_positive(lr_rand, X_raw_test, positive_label=1)
+        proba = lr_rand.predict_proba(X_raw_test)
+        pos_index = list(lr_rand.classes_).index(1)
+        y_score = proba[:, pos_index]
+        prob_rand = y_score
         random_label_aucs.append(roc_auc_score(y_test, prob_rand))
         per_fold_rows.append(
             {
@@ -512,7 +513,10 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_pca.fit(X_pca_train, y_train)
-        prob_pca = proba_positive(lr_pca, X_pca_test, positive_label=1)
+        proba = lr_pca.predict_proba(X_pca_test)
+        pos_index = list(lr_pca.classes_).index(1)
+        y_score = proba[:, pos_index]
+        prob_pca = y_score
         auc_pca = roc_auc_score(y_test, prob_pca)
         per_fold_rows.append(
             {
@@ -546,7 +550,10 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_concat.fit(X_concat_train, y_train)
-        prob_concat = proba_positive(lr_concat, X_concat_test, positive_label=1)
+        proba = lr_concat.predict_proba(X_concat_test)
+        pos_index = list(lr_concat.classes_).index(1)
+        y_score = proba[:, pos_index]
+        prob_concat = y_score
         auc_concat = roc_auc_score(y_test, prob_concat)
         per_fold_rows.append(
             {
