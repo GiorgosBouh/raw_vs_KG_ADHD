@@ -12,6 +12,7 @@ class Config:
     similarity_feature_list: str = "kg/features_acc_selected.txt"
     label_column: str = "ADHD"
     positive_label_value: str = "0"
+    invert_scores: bool = False
     results_dir: str = "results"
 
     random_seed: int = 42

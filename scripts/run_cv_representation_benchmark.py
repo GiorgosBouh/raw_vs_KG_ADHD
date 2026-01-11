@@ -298,6 +298,12 @@ def proba_positive(
     return proba[:, pos_col]
 
 
+def orient_scores(scores: np.ndarray, invert_scores: bool) -> np.ndarray:
+    if invert_scores:
+        return 1 - scores
+    return scores
+
+
 def run(config: Config):
     results_dir = Path(config.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -364,6 +370,7 @@ def run(config: Config):
             "lr_max_iter": config.lr_max_iter,
             "positive_label_value": config.positive_label_value,
             "class_balance": class_balance.tolist(),
+            "invert_scores": config.invert_scores,
         },
     )
 
@@ -456,6 +463,7 @@ def run(config: Config):
                 )
                 lr.fit(X_emb_train, y_train)
                 prob = proba_positive(lr, X_emb_test, y_test, debug=not debug_done, tag="kg")
+                prob = orient_scores(prob, config.invert_scores)
                 debug_done = True
                 auc = roc_auc_score(y_test, prob)
                 if variant == "bipartite" and k_value == config.k_nn_values[0]:
@@ -503,6 +511,7 @@ def run(config: Config):
         )
         lr_raw.fit(X_raw_train, y_train)
         prob_raw = proba_positive(lr_raw, X_raw_test, y_test, debug=not debug_done, tag="raw")
+        prob_raw = orient_scores(prob_raw, config.invert_scores)
         debug_done = True
         auc_raw = roc_auc_score(y_test, prob_raw)
         y_train_rand = y_train.copy()
@@ -516,6 +525,7 @@ def run(config: Config):
         )
         lr_rand.fit(X_raw_train, y_train_rand)
         prob_rand = proba_positive(lr_rand, X_raw_test, y_test, debug=not debug_done, tag="random")
+        prob_rand = orient_scores(prob_rand, config.invert_scores)
         debug_done = True
         random_label_aucs.append(roc_auc_score(y_test, prob_rand))
         per_fold_rows.append(
@@ -557,6 +567,7 @@ def run(config: Config):
         )
         lr_pca.fit(X_pca_train, y_train)
         prob_pca = proba_positive(lr_pca, X_pca_test, y_test, debug=not debug_done, tag="pca")
+        prob_pca = orient_scores(prob_pca, config.invert_scores)
         debug_done = True
         auc_pca = roc_auc_score(y_test, prob_pca)
         per_fold_rows.append(
@@ -592,6 +603,7 @@ def run(config: Config):
         )
         lr_concat.fit(X_concat_train, y_train)
         prob_concat = proba_positive(lr_concat, X_concat_test, y_test, debug=not debug_done, tag="concat")
+        prob_concat = orient_scores(prob_concat, config.invert_scores)
         debug_done = True
         auc_concat = roc_auc_score(y_test, prob_concat)
         per_fold_rows.append(
@@ -748,6 +760,11 @@ def parse_args() -> argparse.Namespace:
         default=CONFIG.positive_label_value,
         help="Value treated as positive class (mapped to 1). Accepts numbers or strings like 'A'/'T'.",
     )
+    parser.add_argument(
+        "--invert-scores",
+        action="store_true",
+        help="Invert predicted scores (1 - score) for all representations.",
+    )
     return parser.parse_args()
 
 
@@ -762,6 +779,7 @@ if __name__ == "__main__":
             similarity_feature_list=args.similarity_feature_list,
             label_column=args.label_column,
             positive_label_value=args.positive_label,
+            invert_scores=args.invert_scores,
             results_dir=args.results_dir,
             random_seed=CONFIG.random_seed,
             k_folds=CONFIG.k_folds,

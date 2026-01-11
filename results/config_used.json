@@ -10,7 +10,9 @@
   "k_folds": 5,
   "k_nn": 5,
   "k_nn_values": [
-    5
+    3,
+    5,
+    10
   ],
   "similarity_metric": "cosine",
   "node2vec_dimensions": 64,
