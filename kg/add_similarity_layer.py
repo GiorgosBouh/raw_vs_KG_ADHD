@@ -34,6 +34,7 @@ def is_entropy_feature(col: str) -> bool:
     return any(k in col for k in ENTROPY_KEYS)
 
 def main():
+    print("Warning: similarity edges are computed on all subjects in this script (transductive).")
     feat = pd.read_csv(FEAT_PATH, engine="python", sep=None)
     pat  = pd.read_csv(PAT_PATH,  engine="python", sep=None)
 

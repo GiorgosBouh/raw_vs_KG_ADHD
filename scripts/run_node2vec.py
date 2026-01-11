@@ -12,6 +12,7 @@ OUT_PATH = "data/processed/badhd_node2vec_subject_embeddings.csv"
 with open(GRAPH_PATH, "rb") as f:
     G = pickle.load(f)
 
+print("Warning: running Node2Vec on a full graph is transductive (includes all subjects).")
 print("Graph loaded:",
       G.number_of_nodes(), "nodes,",
       G.number_of_edges(), "edges")
