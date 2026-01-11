@@ -29,6 +29,7 @@ random.seed(SEED)
 np.random.seed(SEED)
 
 def main():
+    print("Warning: exporting embeddings from a full graph is transductive.")
     driver = get_driver()
 
     # Χτίζουμε NetworkX graph

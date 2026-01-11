@@ -95,7 +95,9 @@ def evaluate_cv(X: pd.DataFrame, y: np.ndarray, model, n_splits: int, seed: int)
 
         pipe.fit(Xtr, ytr)
 
-        prob = pipe.predict_proba(Xte)[:, 1]
+        proba = pipe.predict_proba(Xte)
+        pos_index = list(pipe.named_steps["clf"].classes_).index(1)
+        prob = proba[:, pos_index]
         pred = (prob >= 0.5).astype(int)
 
         y_true_all.append(yte)

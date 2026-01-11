@@ -3,6 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from scripts.label_utils import normalize_labels
+
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -26,6 +28,7 @@ RAW_BASELINE_MODE = os.getenv("RAW_BASELINE_MODE", "feature_list").lower()
 # target handling
 TARGET_COL_IN_PATIENT = os.getenv("TARGET_COL", "ADHD")  # source column in patient_info.csv
 TARGET_NAME_NORMALIZED = "adhd"
+POS_LABEL = os.getenv("POS_LABEL", "0")
 
 # reproducibility
 SEED = int(os.getenv("SEED", "42"))
@@ -60,7 +63,9 @@ def eval_auc(X: np.ndarray, y: np.ndarray, tag: str) -> None:
     aucs = []
     for tr, te in skf.split(X, y):
         clf.fit(X[tr], y[tr])
-        p = clf.predict_proba(X[te])[:, 1]
+        proba = clf.predict_proba(X[te])
+        pos_index = list(clf.named_steps["lr"].classes_).index(1)
+        p = proba[:, pos_index]
         aucs.append(roc_auc_score(y[te], p))
 
     aucs = np.array(aucs, dtype=float)
@@ -68,6 +73,7 @@ def eval_auc(X: np.ndarray, y: np.ndarray, tag: str) -> None:
 
 
 def main():
+    print("Warning: This script evaluates precomputed embeddings and is transductive.")
     # -----------------------------
     # load
     # -----------------------------
@@ -96,7 +102,7 @@ def main():
         raise KeyError("embeddings csv must contain an 'ID' column")
 
     pat = pat.copy()
-    pat[TARGET_NAME_NORMALIZED] = pd.to_numeric(pat[TARGET_COL_IN_PATIENT], errors="coerce").astype("Int64")
+    pat[TARGET_NAME_NORMALIZED] = normalize_labels(pat[TARGET_COL_IN_PATIENT], POS_LABEL)
     pat = pat.dropna(subset=[TARGET_NAME_NORMALIZED]).copy()
     pat[TARGET_NAME_NORMALIZED] = pat[TARGET_NAME_NORMALIZED].astype(int)
 

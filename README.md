@@ -85,8 +85,8 @@ Graph Based Representations of Motor Behavior Improve Machine Learning Predictio
 <h2>Data</h2>
 
 <p>
-The pipeline assumes that movement-derived features have already been computed from
-actigraphy or IMU-like acceleration signals.
+The pipeline assumes that minute-level actigraphy-derived motor activity patterns have
+already been computed from wearable acceleration signals.
 </p>
 
 <p>Feature types include:</p>
@@ -107,65 +107,77 @@ The file <code>features_complete.txt</code> documents the full feature set used 
 
 <h2>Step-by-Step Reproducibility Guide</h2>
 
-<h3>1. Raw Feature-Based Machine Learning (Baseline)</h3>
-
-<p><strong>Location:</strong> <code>baseline_ml/</code></p>
-
-<pre>python bench_raw_ml.py</pre>
+<h3>Recommended Pipeline (Leakage-Free, Fold-Wise)</h3>
 
 <p>
-This script:
+The primary pipeline is implemented in <code>scripts/run_cv_representation_benchmark.py</code> and
+executes a leakage-free evaluation across representations using stratified 5-fold CV. All
+preprocessing (median imputation, standardization) is fit on training folds only.
 </p>
 
+<pre>python -m scripts.run_cv_representation_benchmark</pre>
+
+<p>
+If your data lives outside the default paths (<code>data/raw/features.csv</code> and
+<code>data/raw/patient_info.csv</code>), pass explicit paths:
+</p>
+
+<pre>
+python -m scripts.run_cv_representation_benchmark \
+  --features path/to/features.csv \
+  --patient path/to/patient_info.csv \
+  --k-values 3,5,10 \
+  --label-column ADHD
+</pre>
+
+<p>This pipeline performs:</p>
 <ul>
-    <li>loads raw movement features,</li>
-    <li>trains a logistic regression classifier,</li>
-    <li>uses stratified 5-fold cross-validation,</li>
-    <li>reports ROC–AUC performance.</li>
+    <li>Raw minute-level actigraphy-derived motor activity features (logistic regression)</li>
+    <li>PCA baseline on raw features (logistic regression)</li>
+    <li>Knowledge-graph embeddings (Node2Vec) with fold-wise graph construction</li>
+    <li>Concatenation of raw + projected embeddings</li>
+    <li>Ablations: bipartite vs subject–subject only vs full graph</li>
+    <li>Sensitivity to k in kNN similarity (configurable)</li>
 </ul>
 
-<p>Additional evaluation:</p>
-
-<pre>
-python benchmark_auc.py
-python permutation_importance_lr.py
-</pre>
-
-<h3>2. Knowledge Graph Construction</h3>
-
-<p><strong>Location:</strong> <code>kg/</code></p>
-
-<pre>
-python build_expert_kg.py
-python add_similarity_layer.py
-</pre>
-
+<h4>Leakage-Free Inductive Projection</h4>
 <p>
-Subjects and features are represented as nodes. Subject–subject similarity edges are
-constructed using entropy- and complexity-based descriptors. No new measurements are created.
+Node2Vec is transductive, so each fold fits embeddings only on the training graph.
+Test subjects are mapped to the training embedding space via kNN similarity to the
+training subjects (cosine weights normalized to sum to 1). Similarity normalization
+is learned from training data only.
 </p>
 
-<h3>3. Graph Embedding (Node2Vec)</h3>
+<h4>Outputs</h4>
+<p>All outputs are written to <code>results/</code>:</p>
+<ul>
+    <li><code>auc_per_fold.csv</code> (per-fold AUCs)</li>
+    <li><code>auc_summary.csv</code> (mean, std, and 95% CI)</li>
+    <li><code>predictions.csv</code> (out-of-fold predictions)</li>
+    <li><code>config_used.json</code> (full hyperparameter log)</li>
+    <li><code>perm_importance_raw.csv</code></li>
+    <li><code>perm_importance_emb.csv</code></li>
+    <li><code>perm_importance_concat.csv</code></li>
+    <li><code>sanity_checks.json</code> (label-shuffle and label-inversion AUC checks)</li>
+    <li><code>embeddings_*_fold*_train.csv</code> / <code>embeddings_*_fold*_test.csv</code></li>
+</ul>
 
-<pre>python run_node2vec.py</pre>
-
+<h4>Configuration</h4>
 <p>
-This produces low-dimensional subject embeddings that preserve relational structure.
+All reproducibility parameters (seeds, folds, kNN, Node2Vec, logistic regression, PCA,
+feature list paths) are centralized in <code>scripts/config.py</code>.
 </p>
 
-<h3>4. Machine Learning on Graph Embeddings</h3>
-
-<pre>
-python export_expert_kg_embeddings.py
-python benchmark_auc.py
-</pre>
-
-<h3>5. Combined Representation (Optional)</h3>
-
-<pre>python permutation_importance_lr.py</pre>
-
 <p>
-This evaluates whether concatenating raw features and embeddings improves performance.
+An RBF-SVM baseline is not included because it would require additional dependency
+management beyond the lightweight baseline set; PCA provides a compact representation
+baseline aligned with the study design.
+</p>
+
+<h3>Legacy Scripts (Optional)</h3>
+<p>
+The original scripts in <code>baseline_ml/</code> and <code>kg/</code> are kept for reference, but the
+recommended pipeline above should be used for leakage-free evaluation.
 </p>
 
 <h2>Key Design Principles</h2>
@@ -176,6 +188,23 @@ This evaluates whether concatenating raw features and embeddings improves perfor
     <li><strong>Same evaluation protocol:</strong> stratified 5-fold cross-validation</li>
     <li><strong>No hidden tuning advantages:</strong> representation is the only difference</li>
 </ul>
+
+<h2>Example Command Sequence</h2>
+
+<pre>
+pip install -r requirements.txt
+python -m scripts.run_cv_representation_benchmark
+</pre>
+
+<h2>Troubleshooting</h2>
+<p>
+If you see a <code>SyntaxError</code> that mentions conflict markers (e.g., <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>)
+in <code>scripts/run_cv_representation_benchmark.py</code>, your local copy contains merge artifacts.
+Reset the file(s) to the committed version with:
+</p>
+<pre>
+git checkout -- scripts/run_cv_representation_benchmark.py scripts/config.py
+</pre>
 
 <h2>Intended Use</h2>
 

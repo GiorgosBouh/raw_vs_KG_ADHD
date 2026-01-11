@@ -3,6 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from scripts.label_utils import normalize_labels
+
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -20,6 +22,7 @@ RAW_BASELINE_MODE = os.getenv("RAW_BASELINE_MODE", "mean_only")  # "feature_list
 
 TARGET_COL_IN_PATIENT = os.getenv("TARGET_COL", "ADHD")
 TARGET_NAME_NORMALIZED = "adhd"
+POS_LABEL = os.getenv("POS_LABEL", "0")
 
 SEED = int(os.getenv("SEED", "42"))
 N_SPLITS = int(os.getenv("N_SPLITS", "5"))
@@ -56,7 +59,7 @@ def _align(pat, feat, emb):
         raise KeyError("All of patient_info.csv, features.csv, embeddings.csv must contain 'ID'")
 
     pat = pat.copy()
-    pat[TARGET_NAME_NORMALIZED] = pd.to_numeric(pat[TARGET_COL_IN_PATIENT], errors="coerce").astype("Int64")
+    pat[TARGET_NAME_NORMALIZED] = normalize_labels(pat[TARGET_COL_IN_PATIENT], POS_LABEL)
     pat = pat.dropna(subset=[TARGET_NAME_NORMALIZED]).copy()
     pat[TARGET_NAME_NORMALIZED] = pat[TARGET_NAME_NORMALIZED].astype(int)
 
@@ -106,7 +109,9 @@ def _perm_importance_cv(X: np.ndarray, y: np.ndarray, feature_names: list[str], 
     aucs = []
     for fold, (tr, te) in enumerate(skf.split(X, y), start=1):
         clf.fit(X[tr], y[tr])
-        p = clf.predict_proba(X[te])[:, 1]
+        proba = clf.predict_proba(X[te])
+        pos_index = list(clf.named_steps["lr"].classes_).index(1)
+        p = proba[:, pos_index]
         auc = roc_auc_score(y[te], p)
         aucs.append(auc)
 
