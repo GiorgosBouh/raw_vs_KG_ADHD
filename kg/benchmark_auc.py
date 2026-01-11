@@ -37,7 +37,10 @@ N_SPLITS = int(os.getenv("N_SPLITS", "5"))
 
 def _read_csv_auto(path: str) -> pd.DataFrame:
     # autodetect separator
-    return pd.read_csv(path, engine="python", sep=None)
+    df = pd.read_csv(path, engine="python", sep=None)
+    if df.shape[1] == 1 and ";" in df.columns[0]:
+        df = pd.read_csv(path, sep=";")
+    return df
 
 
 def _read_feature_list(path: str) -> list[str]:

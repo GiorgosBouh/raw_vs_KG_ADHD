@@ -32,7 +32,10 @@ OUTDIR = os.getenv("OUTDIR", "data/processed")
 os.makedirs(OUTDIR, exist_ok=True)
 
 def _read_csv_auto(path: str) -> pd.DataFrame:
-    return pd.read_csv(path, engine="python", sep=None)
+    df = pd.read_csv(path, engine="python", sep=None)
+    if df.shape[1] == 1 and ";" in df.columns[0]:
+        df = pd.read_csv(path, sep=";")
+    return df
 
 def _load_feature_list(path: str) -> list[str]:
     if not path:
