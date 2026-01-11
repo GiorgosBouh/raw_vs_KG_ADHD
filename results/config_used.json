@@ -5,14 +5,13 @@
   "similarity_feature_list": "kg/features_acc_selected.txt",
   "label_column": "ADHD",
   "positive_label_value": "0",
+  "invert_scores": false,
   "results_dir": "results",
   "random_seed": 42,
   "k_folds": 5,
   "k_nn": 5,
   "k_nn_values": [
-    3,
-    5,
-    10
+    5
   ],
   "similarity_metric": "cosine",
   "node2vec_dimensions": 64,
