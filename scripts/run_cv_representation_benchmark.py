@@ -32,7 +32,10 @@ def read_csv_auto(path: str) -> pd.DataFrame:
             f"File not found: {path_obj}. "
             "Set --features/--patient flags or update scripts/config.py with the correct paths."
         )
-    return pd.read_csv(path_obj, engine="python", sep=None)
+    df = pd.read_csv(path_obj, engine="python", sep=None)
+    if df.shape[1] == 1 and ";" in df.columns[0]:
+        df = pd.read_csv(path_obj, sep=";")
+    return df
 
 
 def read_feature_list(path: str) -> list[str]:
@@ -280,6 +283,21 @@ def bootstrap_auc(y_true: np.ndarray, y_score: np.ndarray, n_boot: int, seed: in
     return float(low), float(high)
 
 
+def proba_positive(
+    clf: LogisticRegression,
+    X: np.ndarray,
+    y_test: np.ndarray | None = None,
+    debug: bool = False,
+    tag: str = "",
+) -> np.ndarray:
+    proba = clf.predict_proba(X)
+    pos_col = list(clf.classes_).index(1)
+    if debug:
+        y_unique = set(y_test) if y_test is not None else None
+        print("classes:", clf.classes_, "pos_col:", pos_col, "y_test unique:", y_unique, "tag:", tag)
+    return proba[:, pos_col]
+
+
 def run(config: Config):
     results_dir = Path(config.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -357,6 +375,7 @@ def run(config: Config):
     concat_importances = []
 
     random_label_aucs = []
+    debug_done = False
     for fold, (train_idx, test_idx) in enumerate(skf.split(ids, y), start=1):
         train_ids = ids[train_idx]
         test_ids = ids[test_idx]
@@ -436,10 +455,8 @@ def run(config: Config):
                     random_state=config.random_seed,
                 )
                 lr.fit(X_emb_train, y_train)
-                proba = lr.predict_proba(X_emb_test)
-                pos_index = list(lr.classes_).index(1)
-                y_score = proba[:, pos_index]
-                prob = y_score
+                prob = proba_positive(lr, X_emb_test, y_test, debug=not debug_done, tag="kg")
+                debug_done = True
                 auc = roc_auc_score(y_test, prob)
                 if variant == "bipartite" and k_value == config.k_nn_values[0]:
                     auc_bipartite = auc
@@ -485,10 +502,8 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_raw.fit(X_raw_train, y_train)
-        proba = lr_raw.predict_proba(X_raw_test)
-        pos_index = list(lr_raw.classes_).index(1)
-        y_score = proba[:, pos_index]
-        prob_raw = y_score
+        prob_raw = proba_positive(lr_raw, X_raw_test, y_test, debug=not debug_done, tag="raw")
+        debug_done = True
         auc_raw = roc_auc_score(y_test, prob_raw)
         y_train_rand = y_train.copy()
         rng = np.random.default_rng(config.random_seed + fold)
@@ -500,10 +515,8 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_rand.fit(X_raw_train, y_train_rand)
-        proba = lr_rand.predict_proba(X_raw_test)
-        pos_index = list(lr_rand.classes_).index(1)
-        y_score = proba[:, pos_index]
-        prob_rand = y_score
+        prob_rand = proba_positive(lr_rand, X_raw_test, y_test, debug=not debug_done, tag="random")
+        debug_done = True
         random_label_aucs.append(roc_auc_score(y_test, prob_rand))
         per_fold_rows.append(
             {
@@ -543,10 +556,8 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_pca.fit(X_pca_train, y_train)
-        proba = lr_pca.predict_proba(X_pca_test)
-        pos_index = list(lr_pca.classes_).index(1)
-        y_score = proba[:, pos_index]
-        prob_pca = y_score
+        prob_pca = proba_positive(lr_pca, X_pca_test, y_test, debug=not debug_done, tag="pca")
+        debug_done = True
         auc_pca = roc_auc_score(y_test, prob_pca)
         per_fold_rows.append(
             {
@@ -580,10 +591,8 @@ def run(config: Config):
             random_state=config.random_seed,
         )
         lr_concat.fit(X_concat_train, y_train)
-        proba = lr_concat.predict_proba(X_concat_test)
-        pos_index = list(lr_concat.classes_).index(1)
-        y_score = proba[:, pos_index]
-        prob_concat = y_score
+        prob_concat = proba_positive(lr_concat, X_concat_test, y_test, debug=not debug_done, tag="concat")
+        debug_done = True
         auc_concat = roc_auc_score(y_test, prob_concat)
         per_fold_rows.append(
             {
@@ -690,13 +699,15 @@ def run(config: Config):
     shuffled = raw_pred["y_true"].to_numpy().copy()
     rng.shuffle(shuffled)
     shuffled_auc = roc_auc_score(shuffled, raw_pred["y_score"])
-    inverted_auc = roc_auc_score(1 - raw_pred["y_true"].to_numpy(), raw_pred["y_score"])
+    scores_inverted_auc = roc_auc_score(raw_pred["y_true"], 1 - raw_pred["y_score"].to_numpy())
+    labels_flipped_auc = roc_auc_score(1 - raw_pred["y_true"].to_numpy(), raw_pred["y_score"])
 
 
     sanity = {
         "raw_auc": float(raw_auc),
         "shuffled_label_auc": float(shuffled_auc),
-        "inverted_label_auc": float(inverted_auc),
+        "scores_inverted_auc": float(scores_inverted_auc),
+        "labels_flipped_auc": float(labels_flipped_auc),
         "random_label_auc_mean": float(np.mean(random_label_aucs)),
         "random_label_auc_std": float(np.std(random_label_aucs)),
     }
@@ -710,7 +721,7 @@ def run(config: Config):
             "Warning: raw AUC < 0.5. Verify label encoding/positive label orientation "
             f"(positive_label_value={config.positive_label_value})."
         )
-    if inverted_auc > raw_auc:
+    if labels_flipped_auc > raw_auc or scores_inverted_auc > raw_auc:
         print("Note: inverted AUC > raw AUC suggests positive-label orientation mismatch.")
     print("\nSaved outputs to:", results_dir.resolve())
 

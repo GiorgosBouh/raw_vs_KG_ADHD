@@ -1,0 +1,8 @@
+{
+  "raw_auc": 0.41055555555555556,
+  "shuffled_label_auc": 0.43333333333333335,
+  "scores_inverted_auc": 0.5894444444444444,
+  "labels_flipped_auc": 0.5894444444444445,
+  "random_label_auc_mean": 0.41944444444444445,
+  "random_label_auc_std": 0.04427049291808118
+}
