@@ -1,0 +1,10 @@
+{
+  "dropped_all_nan": [
+    "ACC__friedrich_coefficients__coeff_0__m_3__r_30",
+    "ACC__friedrich_coefficients__coeff_1__m_3__r_30",
+    "ACC__friedrich_coefficients__coeff_2__m_3__r_30",
+    "ACC__friedrich_coefficients__coeff_3__m_3__r_30",
+    "ACC__max_langevin_fixed_point__m_3__r_30",
+    "ACC__query_similarity_count__query_None__threshold_0.0"
+  ]
+}

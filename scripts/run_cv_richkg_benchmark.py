@@ -329,9 +329,9 @@ def main() -> None:
 
         imputed_train = _impute_dataframe(train_features, train_stats)
         imputed_test = _impute_dataframe(test_features, train_stats)
-        imputed_train_df = imputed_train.copy()
+        imputed_train_df = imputed_train.reset_index(drop=True)
         imputed_train_df["ID"] = train_ids
-        imputed_test_df = imputed_test.copy()
+        imputed_test_df = imputed_test.reset_index(drop=True)
         imputed_test_df["ID"] = test_ids
 
         scaler = StandardScaler()
