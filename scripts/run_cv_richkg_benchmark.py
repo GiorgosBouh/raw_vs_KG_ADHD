@@ -201,6 +201,14 @@ def _graph_kind_counts(graph: nx.Graph) -> dict[str, int]:
     return counts
 
 
+def _sanitize_graph_weights(graph: nx.Graph, default_weight: float = 1.0) -> None:
+    for _, _, data in graph.edges(data=True):
+        weight = data.get("weight", default_weight)
+        if not np.isfinite(weight):
+            weight = default_weight
+        data["weight"] = float(weight)
+
+
 def _bootstrap_ci(values: np.ndarray, seed: int, n_boot: int = 1000) -> tuple[float, float]:
     rng = np.random.default_rng(seed)
     if values.size == 0:
@@ -383,6 +391,7 @@ def main() -> None:
         for _, row in test_graph_rows.iterrows():
             attach_subject_node(train_graph, row, train_stats, options, is_test=True)
 
+        _sanitize_graph_weights(train_graph)
         kind_counts = _graph_kind_counts(train_graph)
         print(
             f"[Repeat {repeat} Fold {fold}] Graph nodes={train_graph.number_of_nodes()} "

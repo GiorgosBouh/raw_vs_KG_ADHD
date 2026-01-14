@@ -117,6 +117,8 @@ def compute_feature_correlations(
             continue
         top = series.reindex(series.abs().sort_values(ascending=False).head(top_k).index)
         for other, rho in top.items():
+            if not np.isfinite(rho):
+                continue
             edges.append((feat, other, float(rho)))
     return edges
 
@@ -232,7 +234,10 @@ def build_train_graph(
                 continue
             if graph.has_edge(node_a, node_b):
                 continue
-            graph.add_edge(node_a, node_b, rel="CORRELATED_WITH", rho=rho, weight=abs(rho))
+            weight = abs(rho)
+            if not np.isfinite(weight):
+                continue
+            graph.add_edge(node_a, node_b, rel="CORRELATED_WITH", rho=rho, weight=weight)
 
     if options.get("include_similarity"):
         for sid_a, sid_b, sim in options.get("similarity_edges", []):
