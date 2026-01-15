@@ -212,6 +212,30 @@ def _embedding_dataframe(model: Node2Vec, subject_ids: list[str]) -> pd.DataFram
     return emb_df
 
 
+def _select_entropy_features(feature_columns: list[str]) -> list[str]:
+    patterns = ("entropy", "lempel_ziv")
+    return [c for c in feature_columns if any(p in c.lower() for p in patterns)]
+
+
+def _select_variance_features(feature_columns: list[str]) -> list[str]:
+    patterns = ("variance", "std", "variation")
+    return [c for c in feature_columns if any(p in c.lower() for p in patterns)]
+
+
+def _aggregate_subject_score(matrix: pd.DataFrame, columns: list[str]) -> pd.Series:
+    if not columns:
+        return pd.Series([], dtype=float)
+    return matrix[columns].mean(axis=1)
+
+
+def _medication_flags(patient_df: pd.DataFrame) -> pd.Series:
+    med_cols = [c for c in patient_df.columns if c.upper().startswith("MED")]
+    if not med_cols:
+        return pd.Series([0] * len(patient_df), index=patient_df["ID"])
+    med_values = patient_df[med_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    return (med_values.gt(0).any(axis=1)).astype(int).set_axis(patient_df["ID"])
+
+
 def _read_feature_list(path: str | None) -> list[str] | None:
     if not path:
         return None
@@ -347,6 +371,7 @@ def main() -> None:
     pred_records = []
     delta_records = []
     split_records = []
+    interaction_records = []
 
     perm_delta_kg_sums = np.zeros(args.permutations, dtype=float)
     perm_delta_concat_sums = np.zeros(args.permutations, dtype=float)
@@ -545,6 +570,59 @@ def main() -> None:
             }
         )
 
+        entropy_cols = _select_entropy_features(feature_columns)
+        variance_cols = _select_variance_features(feature_columns)
+        entropy_train_scores = _aggregate_subject_score(imputed_train, entropy_cols)
+        variance_train_scores = _aggregate_subject_score(imputed_train, variance_cols)
+
+        subgroup_definitions: list[tuple[str, pd.Series, pd.Series]] = []
+        if not entropy_train_scores.empty:
+            entropy_threshold = float(np.nanmedian(entropy_train_scores))
+            entropy_test_scores = _aggregate_subject_score(imputed_test, entropy_cols)
+            entropy_group = (entropy_test_scores >= entropy_threshold).map(
+                {True: "high_entropy", False: "low_entropy"}
+            )
+            subgroup_definitions.append(("entropy", entropy_group, entropy_test_scores))
+
+        if not variance_train_scores.empty:
+            variance_threshold = float(np.nanmedian(variance_train_scores))
+            variance_test_scores = _aggregate_subject_score(imputed_test, variance_cols)
+            variance_group = (variance_test_scores >= variance_threshold).map(
+                {True: "high_variance", False: "low_variance"}
+            )
+            subgroup_definitions.append(("variance", variance_group, variance_test_scores))
+
+        med_flags = _medication_flags(test_patient)
+        med_group = med_flags.reindex(test_ids).fillna(0).map({1: "medication", 0: "no_medication"})
+        subgroup_definitions.append(("medication", med_group, med_flags.reindex(test_ids)))
+
+        for subgroup_name, subgroup_labels, subgroup_scores in subgroup_definitions:
+            for level in subgroup_labels.dropna().unique():
+                mask = subgroup_labels == level
+                if mask.sum() < 10:
+                    continue
+                y_sub = test_labels[mask.to_numpy()]
+                if len(np.unique(y_sub)) < 2:
+                    continue
+                prob_raw_sub = np.array(prob_raw)[mask.to_numpy()]
+                prob_concat_sub = np.array(prob_concat)[mask.to_numpy()]
+                auc_raw_sub = roc_auc_score(y_sub, prob_raw_sub)
+                auc_concat_sub = roc_auc_score(y_sub, prob_concat_sub)
+                interaction_records.append(
+                    {
+                        "repeat": repeat,
+                        "fold": fold,
+                        "subgroup": subgroup_name,
+                        "level": level,
+                        "n": int(mask.sum()),
+                        "pos": int(y_sub.sum()),
+                        "neg": int(len(y_sub) - y_sub.sum()),
+                        "auc_raw": auc_raw_sub,
+                        "auc_concat": auc_concat_sub,
+                        "delta_concat": auc_concat_sub - auc_raw_sub,
+                    }
+                )
+
         for perm_idx in range(args.permutations):
             perm_train = rng.permutation(train_labels)
             perm_test = rng.permutation(test_labels)
@@ -581,6 +659,24 @@ def main() -> None:
 
     split_df = pd.DataFrame(split_records)
     split_df.to_csv(results_dir / "splits_summary.csv", index=False)
+
+    if interaction_records:
+        interaction_df = pd.DataFrame(interaction_records)
+        interaction_df.to_csv(results_dir / "interaction_analysis.csv", index=False)
+        summary_rows = (
+            interaction_df.groupby(["subgroup", "level"])
+            .agg(
+                mean_delta=("delta_concat", "mean"),
+                std_delta=("delta_concat", "std"),
+                mean_auc_raw=("auc_raw", "mean"),
+                mean_auc_concat=("auc_concat", "mean"),
+                n=("n", "sum"),
+                pos=("pos", "sum"),
+                neg=("neg", "sum"),
+            )
+            .reset_index()
+        )
+        summary_rows.to_csv(results_dir / "interaction_analysis_summary.csv", index=False)
 
     auc_summary = pd.DataFrame(
         [
@@ -663,3 +759,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

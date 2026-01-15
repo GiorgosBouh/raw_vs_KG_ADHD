@@ -296,3 +296,4 @@ def build_train_graph(
             graph.add_edge(node_a, node_b, rel="SIMILAR_TO", weight=float(sim))
 
     return graph
+
