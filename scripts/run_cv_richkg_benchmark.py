@@ -27,6 +27,7 @@ from scripts.kg_rich_builder import (
     load_csv_auto,
     build_train_graph,
     attach_subject_node,
+    subject_context_nodes,
 )
 
 
@@ -57,6 +58,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p", type=float, default=1.0, help="Node2Vec p")
     parser.add_argument("--q", type=float, default=1.0, help="Node2Vec q")
     parser.add_argument("--C", type=float, default=1.0, help="LogisticRegression C")
+    parser.add_argument(
+        "--evaluation-mode",
+        default="inductive",
+        choices=["inductive", "transductive"],
+        help="Inductive excludes test nodes from node2vec; transductive attaches test nodes.",
+    )
+    parser.add_argument(
+        "--projection",
+        default="mean",
+        choices=["mean", "weighted"],
+        help="How to project test subject embeddings in inductive mode.",
+    )
+    parser.add_argument(
+        "--projection-weight",
+        default="uniform",
+        choices=["uniform", "abs_value", "abs_z"],
+        help="Weight scheme for inductive projection when using weighted projection.",
+    )
+    parser.add_argument("--feature-list", default=None, help="Optional feature list file for Track A.")
     parser.add_argument("--permutations", type=int, default=200, help="Permutation test runs")
     parser.add_argument("--results-dir", default="results", help="Results directory")
     return parser.parse_args()
@@ -93,10 +113,16 @@ def _print_sanity(df: pd.DataFrame, name: str) -> None:
 def _prepare_features(
     features_df: pd.DataFrame,
     id_column: str,
+    feature_list: list[str] | None,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     features = features_df.copy()
     features["ID"] = features[id_column].astype(str)
     feature_cols = [c for c in features.columns if c != id_column and c != "ID"]
+    if feature_list is not None:
+        selected = [c for c in feature_cols if c in feature_list]
+        if not selected:
+            raise ValueError("No raw features found that match the provided feature list.")
+        feature_cols = selected
     features[feature_cols] = features[feature_cols].apply(pd.to_numeric, errors="coerce")
     dropped = [c for c in feature_cols if features[c].isna().all()]
     if dropped:
@@ -186,6 +212,40 @@ def _embedding_dataframe(model: Node2Vec, subject_ids: list[str]) -> pd.DataFram
     return emb_df
 
 
+def _read_feature_list(path: str | None) -> list[str] | None:
+    if not path:
+        return None
+    items: list[str] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            items.append(entry)
+    return items or None
+
+
+def _project_subject_embedding(
+    model: Node2Vec,
+    node_weights: list[tuple[str, float]],
+    mode: str,
+) -> np.ndarray:
+    vectors = []
+    weights = []
+    for node, weight in node_weights:
+        if node in model.wv:
+            vectors.append(model.wv[node])
+            weights.append(weight)
+    if not vectors:
+        return np.full(model.wv.vector_size, np.nan)
+    mat = np.vstack(vectors)
+    if mode == "weighted":
+        weight_arr = np.array(weights, dtype=float)
+        weight_arr = np.where(np.isfinite(weight_arr) & (weight_arr > 0), weight_arr, 1.0)
+        return np.average(mat, axis=0, weights=weight_arr)
+    return np.mean(mat, axis=0)
+
+
 def _summary_auc(auc_values: np.ndarray, label: str) -> dict[str, Any]:
     mean = float(np.mean(auc_values))
     std = float(np.std(auc_values, ddof=1)) if auc_values.size > 1 else 0.0
@@ -260,7 +320,8 @@ def main() -> None:
     features_df, patient_df = align_features_patient(features_df, patient_df, "ID", "ID")
     labels = patient_df.set_index("ID")["label"].astype(int)
 
-    features_df, feature_columns, dropped_columns = _prepare_features(features_df, "ID")
+    feature_list = _read_feature_list(args.feature_list)
+    features_df, feature_columns, dropped_columns = _prepare_features(features_df, "ID", feature_list)
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -388,8 +449,9 @@ def main() -> None:
             on="ID",
             how="left",
         )
-        for _, row in test_graph_rows.iterrows():
-            attach_subject_node(train_graph, row, train_stats, options, is_test=True)
+        if args.evaluation_mode == "transductive":
+            for _, row in test_graph_rows.iterrows():
+                attach_subject_node(train_graph, row, train_stats, options, is_test=True)
 
         _sanitize_graph_weights(train_graph)
         kind_counts = _graph_kind_counts(train_graph)
@@ -400,7 +462,20 @@ def main() -> None:
 
         n2v_model = _fit_node2vec(train_graph, args.seed + split_idx, args)
         emb_train_df = _embedding_dataframe(n2v_model, train_ids)
-        emb_test_df = _embedding_dataframe(n2v_model, test_ids)
+        if args.evaluation_mode == "inductive":
+            projected = []
+            for _, row in test_graph_rows.iterrows():
+                node_weights = subject_context_nodes(
+                    row,
+                    train_stats,
+                    options,
+                    weight_mode=args.projection_weight,
+                )
+                projected.append(_project_subject_embedding(n2v_model, node_weights, args.projection))
+            emb_test_df = pd.DataFrame(projected)
+            emb_test_df.insert(0, "ID", test_ids)
+        else:
+            emb_test_df = _embedding_dataframe(n2v_model, test_ids)
 
         emb_train_path = results_dir / f"embeddings_richkg_{args.kg_variant}_fold{fold_id}_train.csv"
         emb_test_path = results_dir / f"embeddings_richkg_{args.kg_variant}_fold{fold_id}_test.csv"
@@ -576,6 +651,7 @@ def main() -> None:
     config_payload = {
         "args": vars(args),
         "feature_columns_used": feature_columns,
+        "feature_list_path": args.feature_list,
         "dropped_all_nan": dropped_columns,
     }
     with open(results_dir / "config_used.json", "w", encoding="utf-8") as handle:

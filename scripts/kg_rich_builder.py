@@ -143,6 +143,54 @@ def _is_clinical(column: str) -> bool:
     return any(token in name for token in tokens)
 
 
+def subject_context_nodes(
+    subject_row: pd.Series,
+    train_stats: TrainStats,
+    options: dict[str, Any],
+    weight_mode: str = "uniform",
+) -> list[tuple[str, float]]:
+    nodes: list[tuple[str, float]] = []
+    for feat in train_stats.feature_columns:
+        val = pd.to_numeric(subject_row.get(feat, np.nan), errors="coerce")
+        if np.isnan(val):
+            continue
+        feature_node = f"F|{feat}"
+        if weight_mode == "abs_value":
+            weight = float(abs(val))
+        elif weight_mode == "abs_z":
+            mean = train_stats.means.get(feat, 0.0)
+            std = train_stats.stds.get(feat, 1.0)
+            weight = float(abs((val - mean) / std)) if std != 0 else 1.0
+        else:
+            weight = 1.0
+        nodes.append((feature_node, weight))
+
+        if options.get("include_bins"):
+            bin_idx = _bin_index(train_stats.bin_edges.get(feat), float(val))
+            if bin_idx is not None:
+                bin_node = f"BIN|{feat}|{bin_idx}"
+                nodes.append((bin_node, 1.0))
+
+    if options.get("include_demo"):
+        demo_columns = options.get("demo_columns", [])
+        demo_bins: dict[str, np.ndarray | None] = options.get("demo_bin_edges", {})
+        for col in demo_columns:
+            val = subject_row.get(col, np.nan)
+            if pd.isna(val):
+                continue
+            if col in demo_bins and demo_bins[col] is not None:
+                bin_idx = _bin_index(demo_bins[col], float(val))
+                nodes.append((f"DEMO|{col}|BIN{bin_idx}", 1.0))
+                continue
+            node_value = str(val)
+            if _is_clinical(col):
+                nodes.append((f"CLIN|{col}|{node_value}", 1.0))
+            else:
+                nodes.append((f"DEMO|{col}|{node_value}", 1.0))
+
+    return nodes
+
+
 def attach_subject_node(
     graph: nx.Graph,
     subject_row: pd.Series,
