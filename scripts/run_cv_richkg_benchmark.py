@@ -124,6 +124,7 @@ def _prepare_features(
             raise ValueError("No raw features found that match the provided feature list.")
         feature_cols = selected
     features[feature_cols] = features[feature_cols].apply(pd.to_numeric, errors="coerce")
+    features[feature_cols] = features[feature_cols].replace([np.inf, -np.inf], np.nan)
     dropped = [c for c in feature_cols if features[c].isna().all()]
     if dropped:
         features = features.drop(columns=dropped)
@@ -136,10 +137,13 @@ def _impute_dataframe(df: pd.DataFrame, stats: TrainStats | None = None) -> pd.D
         imputer = SimpleImputer(strategy="median")
         imputed = imputer.fit_transform(df)
         return pd.DataFrame(imputed, columns=df.columns, index=df.index)
-    values = df.copy()
+    values = df.replace([np.inf, -np.inf], np.nan).copy()
     for col in df.columns:
         median = stats.medians.get(col, np.nan)
+        if not np.isfinite(median):
+            median = 0.0
         values[col] = values[col].fillna(median)
+    values = values.replace([np.inf, -np.inf], 0.0)
     return values
 
 
@@ -759,4 +763,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
