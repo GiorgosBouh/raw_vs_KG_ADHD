@@ -1,44 +1,246 @@
-"""Leakage-free CV benchmark for raw and KG representations."""
+"""Repeated CV benchmark for raw, rich KG, and concatenated representations."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import networkx as nx
 from node2vec import Node2Vec
 
-from dataclasses import asdict
-
-from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
-from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-from scripts.config import CONFIG, Config
+from scripts.kg_rich_builder import (
+    TrainStats,
+    align_features_patient,
+    compute_feature_correlations,
+    detect_id_column,
+    fit_train_stats,
+    load_csv_auto,
+    build_train_graph,
+    attach_subject_node,
+    subject_context_nodes,
+)
 
 
-def read_csv_auto(path: str) -> pd.DataFrame:
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise FileNotFoundError(
-            f"File not found: {path_obj}. "
-            "Set --features/--patient flags or update scripts/config.py with the correct paths."
-        )
-    df = pd.read_csv(path_obj, engine="python", sep=None)
-    if df.shape[1] == 1 and ";" in df.columns[0]:
-        df = pd.read_csv(path_obj, sep=";")
-    return df
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Leakage-free rich KG benchmark.")
+    parser.add_argument("--features", required=True, help="Path to features.csv")
+    parser.add_argument("--patient", required=True, help="Path to patient_info.csv")
+    parser.add_argument("--label-column", required=True, help="Label column in patient file")
+    parser.add_argument("--positive-label", default="1", help="Positive label value")
+    parser.add_argument("--repeats", type=int, default=10, help="Number of repeats")
+    parser.add_argument("--folds", type=int, default=5, help="Number of folds")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--kg-variant", default="rich", choices=[
+        "bipartite_only",
+        "bins",
+        "bins_corr",
+        "bins_demo",
+        "rich",
+        "rich_with_similarity",
+    ])
+    parser.add_argument("--bins", type=int, default=5, help="Number of quantile bins")
+    parser.add_argument("--corr-topk", type=int, default=5, help="Top-K feature correlations")
+    parser.add_argument("--knn-k", type=int, default=5, help="K for subject similarity")
+    parser.add_argument("--node2vec-dim", type=int, default=64, help="Node2Vec dimensions")
+    parser.add_argument("--walk-length", type=int, default=20, help="Node2Vec walk length")
+    parser.add_argument("--num-walks", type=int, default=50, help="Node2Vec num walks")
+    parser.add_argument("--window", type=int, default=10, help="Node2Vec window")
+    parser.add_argument("--p", type=float, default=1.0, help="Node2Vec p")
+    parser.add_argument("--q", type=float, default=1.0, help="Node2Vec q")
+    parser.add_argument("--C", type=float, default=1.0, help="LogisticRegression C")
+    parser.add_argument(
+        "--evaluation-mode",
+        default="inductive",
+        choices=["inductive", "transductive"],
+        help="Inductive excludes test nodes from node2vec; transductive attaches test nodes.",
+    )
+    parser.add_argument(
+        "--projection",
+        default="mean",
+        choices=["mean", "weighted"],
+        help="How to project test subject embeddings in inductive mode.",
+    )
+    parser.add_argument(
+        "--projection-weight",
+        default="uniform",
+        choices=["uniform", "abs_value", "abs_z"],
+        help="Weight scheme for inductive projection when using weighted projection.",
+    )
+    parser.add_argument("--feature-list", default=None, help="Optional feature list file for Track A.")
+    parser.add_argument("--permutations", type=int, default=200, help="Permutation test runs")
+    parser.add_argument("--results-dir", default="results", help="Results directory")
+    return parser.parse_args()
 
 
-def read_feature_list(path: str) -> list[str]:
+def _normalize_label(values: pd.Series, positive_label: str) -> pd.Series:
+    pos_value = str(positive_label).strip().upper()
+    if values.dtype == object:
+        normalized = values.astype(str).str.strip().str.upper()
+        if set(normalized.dropna().unique()).issubset({"A", "T"}):
+            mapped = normalized.map({"A": 1, "T": 0})
+            if pos_value in {"A", "T"}:
+                target = 1 if pos_value == "A" else 0
+                return (mapped == target).astype(int)
+            return mapped.astype(int)
+        numeric = pd.to_numeric(values, errors="coerce")
+        if pos_value.isdigit():
+            return (numeric == float(pos_value)).astype(int)
+        return numeric.astype(float)
+    numeric = pd.to_numeric(values, errors="coerce")
+    if pos_value.isdigit():
+        return (numeric == float(pos_value)).astype(int)
+    return numeric.astype(float)
+
+
+def _print_sanity(df: pd.DataFrame, name: str) -> None:
+    if df.shape[1] <= 5:
+        raise ValueError(f"{name} has too few columns after parsing: {df.shape[1]}")
+    print(f"{name} first 5 columns: {list(df.columns[:5])}")
+    print(f"{name} shape: {df.shape}")
+    print(df.head(2))
+
+
+def _prepare_features(
+    features_df: pd.DataFrame,
+    id_column: str,
+    feature_list: list[str] | None,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    features = features_df.copy()
+    features["ID"] = features[id_column].astype(str)
+    feature_cols = [c for c in features.columns if c != id_column and c != "ID"]
+    if feature_list is not None:
+        selected = [c for c in feature_cols if c in feature_list]
+        if not selected:
+            raise ValueError("No raw features found that match the provided feature list.")
+        feature_cols = selected
+    features[feature_cols] = features[feature_cols].apply(pd.to_numeric, errors="coerce")
+    dropped = [c for c in feature_cols if features[c].isna().all()]
+    if dropped:
+        features = features.drop(columns=dropped)
+    final_cols = [c for c in features.columns if c != "ID"]
+    return features, final_cols, dropped
+
+
+def _impute_dataframe(df: pd.DataFrame, stats: TrainStats | None = None) -> pd.DataFrame:
+    if stats is None:
+        imputer = SimpleImputer(strategy="median")
+        imputed = imputer.fit_transform(df)
+        return pd.DataFrame(imputed, columns=df.columns, index=df.index)
+    values = df.copy()
+    for col in df.columns:
+        median = stats.medians.get(col, np.nan)
+        if not np.isfinite(median):
+            median = 0.0
+        values[col] = values[col].fillna(median)
+    return values
+
+
+def _prepare_demo_columns(patient_df: pd.DataFrame, label_column: str) -> list[str]:
+    return [c for c in patient_df.columns if c not in {"ID", label_column}]
+
+
+def _demo_bin_edges(train_patient: pd.DataFrame, demo_columns: list[str], n_bins: int) -> dict[str, np.ndarray | None]:
+    edges: dict[str, np.ndarray | None] = {}
+    for col in demo_columns:
+        numeric = pd.to_numeric(train_patient[col], errors="coerce")
+        non_nan = numeric.dropna()
+        if non_nan.empty:
+            edges[col] = None
+            continue
+        if non_nan.nunique() > n_bins:
+            values = np.unique(np.nanquantile(non_nan, np.linspace(0, 1, n_bins + 1)))
+            edges[col] = values if values.size > 2 else None
+        else:
+            edges[col] = None
+    return edges
+
+
+def _build_similarity_edges(train_ids: np.ndarray, train_matrix: np.ndarray, k: int) -> list[tuple[str, str, float]]:
+    if k <= 0:
+        return []
+    norms = np.linalg.norm(train_matrix, axis=1) + 1e-9
+    normalized = train_matrix / norms[:, None]
+    sim = normalized @ normalized.T
+    edges: list[tuple[str, str, float]] = []
+    for i in range(sim.shape[0]):
+        sims = sim[i].copy()
+        sims[i] = -np.inf
+        k_eff = min(k, sim.shape[0] - 1)
+        if k_eff <= 0:
+            continue
+        idx = np.argpartition(-sims, k_eff - 1)[:k_eff]
+        idx = idx[np.argsort(-sims[idx])]
+        for j in idx:
+            edges.append((str(train_ids[i]), str(train_ids[j]), float(sims[j])))
+    return edges
+
+
+def _fit_node2vec(graph: nx.Graph, seed: int, args: argparse.Namespace) -> Node2Vec:
+    node2vec = Node2Vec(
+        graph,
+        dimensions=args.node2vec_dim,
+        walk_length=args.walk_length,
+        num_walks=args.num_walks,
+        p=args.p,
+        q=args.q,
+        workers=1,
+        seed=seed,
+        quiet=True,
+    )
+    model = node2vec.fit(window=args.window, min_count=1, batch_words=128, seed=seed)
+    return model
+
+
+def _embedding_dataframe(model: Node2Vec, subject_ids: list[str]) -> pd.DataFrame:
+    embeddings = []
+    for sid in subject_ids:
+        node = f"S{sid}"
+        if node not in model.wv:
+            embeddings.append([np.nan] * model.wv.vector_size)
+        else:
+            embeddings.append(model.wv[node].tolist())
+    emb_df = pd.DataFrame(embeddings)
+    emb_df.insert(0, "ID", subject_ids)
+    return emb_df
+
+
+def _select_entropy_features(feature_columns: list[str]) -> list[str]:
+    patterns = ("entropy", "lempel_ziv")
+    return [c for c in feature_columns if any(p in c.lower() for p in patterns)]
+
+
+def _select_variance_features(feature_columns: list[str]) -> list[str]:
+    patterns = ("variance", "std", "variation")
+    return [c for c in feature_columns if any(p in c.lower() for p in patterns)]
+
+
+def _aggregate_subject_score(matrix: pd.DataFrame, columns: list[str]) -> pd.Series:
+    if not columns:
+        return pd.Series([], dtype=float)
+    return matrix[columns].mean(axis=1)
+
+
+def _medication_flags(patient_df: pd.DataFrame) -> pd.Series:
+    med_cols = [c for c in patient_df.columns if c.upper().startswith("MED")]
+    if not med_cols:
+        return pd.Series([0] * len(patient_df), index=patient_df["ID"])
+    med_values = patient_df[med_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    return (med_values.gt(0).any(axis=1)).astype(int).set_axis(patient_df["ID"])
+
+
+def _read_feature_list(path: str | None) -> list[str] | None:
+    if not path:
+        return None
     items: list[str] = []
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -46,758 +248,516 @@ def read_feature_list(path: str) -> list[str]:
             if not entry or entry.startswith("#"):
                 continue
             items.append(entry)
-    seen = set()
-    ordered = []
-    for item in items:
-        if item not in seen:
-            ordered.append(item)
-            seen.add(item)
-    return ordered
+    return items or None
 
 
-def expert_mapping(feature_name: str) -> tuple[str, str, str]:
-    name = feature_name.lower()
-    if "entropy" in name or "lempel_ziv" in name:
-        prop = "Entropy/Complexity"
-        beh = "Irregularity"
-    elif "cv" in name or "__std" in name or "std" in name:
-        prop = "Variability"
-        beh = "Instability"
-    else:
-        prop = "Temporal"
-        beh = "Rhythmicity"
-
-    if ("__mean" in feature_name) or ("\"mean\"" in feature_name) or (
-        "feature_\"mean\"" in feature_name
-    ) or ("f_agg_\"mean\"" in feature_name):
-        tmp = "Mean"
-    elif "__std" in name or "std" in name:
-        tmp = "Dispersion"
-    else:
-        tmp = "Temporal"
-
-    return prop, beh, tmp
-
-
-def align_inputs(
-    features: pd.DataFrame,
-    patient: pd.DataFrame,
-    label_column: str,
-    positive_label_value: str,
-) -> tuple[pd.DataFrame, pd.Series]:
-    for df in (features, patient):
-        df.columns = [c.strip() for c in df.columns]
-
-    if "ID" not in features.columns or "ID" not in patient.columns:
-        raise KeyError("Both features.csv and patient_info.csv must include an 'ID' column.")
-    if label_column not in patient.columns:
-        raise KeyError(f"patient_info.csv missing label column '{label_column}'.")
-
-    features = features.copy()
-    patient = patient.copy()
-
-    if "filter_$" in patient.columns:
-        patient = patient[patient["filter_$"] == 1].copy()
-
-    label_raw = patient[label_column]
-    pos_value = str(positive_label_value).strip().upper()
-
-    if label_raw.dtype == object:
-        label_norm = label_raw.astype(str).str.strip().str.upper()
-        if set(label_norm.dropna().unique()).issubset({"A", "T"}):
-            mapped = label_norm.map({"A": 1, "T": 0})
-            if pos_value in {"A", "T"}:
-                pos_numeric = 1 if pos_value == "A" else 0
-                patient[label_column] = (mapped == pos_numeric).astype(int)
-            else:
-                patient[label_column] = mapped
-        else:
-            patient[label_column] = pd.to_numeric(label_raw, errors="coerce")
-    else:
-        patient[label_column] = pd.to_numeric(label_raw, errors="coerce")
-
-    patient = patient.dropna(subset=[label_column])
-    try:
-        pos_numeric = float(pos_value)
-    except ValueError:
-        pos_numeric = None
-
-    if pos_numeric is not None:
-        patient[label_column] = (patient[label_column].astype(float) == pos_numeric).astype(int)
-
-    features["ID"] = pd.to_numeric(features["ID"], errors="coerce").astype("Int64")
-    patient["ID"] = pd.to_numeric(patient["ID"], errors="coerce").astype("Int64")
-
-    common_ids = sorted(set(features["ID"].dropna().astype(int)).intersection(
-        set(patient["ID"].dropna().astype(int))
-    ))
-    if not common_ids:
-        raise ValueError("No overlapping IDs between features and patient_info.")
-
-    features = features[features["ID"].astype(int).isin(common_ids)].copy()
-    patient = patient[patient["ID"].astype(int).isin(common_ids)].copy()
-
-    features = features.sort_values("ID").reset_index(drop=True)
-    patient = patient.sort_values("ID").reset_index(drop=True)
-
-    labels = patient.set_index("ID")[label_column].astype(int)
-    return features, labels
-
-
-def build_similarity_edges(train_ids: np.ndarray, train_matrix: np.ndarray, k: int) -> list[tuple[int, int, float]]:
-    norms = np.linalg.norm(train_matrix, axis=1) + 1e-9
-    train_normed = train_matrix / norms[:, None]
-    sim = train_normed @ train_normed.T
-
-    edges: list[tuple[int, int, float]] = []
-    n = sim.shape[0]
-    for i in range(n):
-        sims = sim[i].copy()
-        sims[i] = -np.inf
-        k_eff = min(k, n - 1)
-        if k_eff <= 0:
-            continue
-        idx = np.argpartition(-sims, k_eff - 1)[:k_eff]
-        idx = idx[np.argsort(-sims[idx])]
-        for j in idx:
-            edges.append((int(train_ids[i]), int(train_ids[j]), float(sims[j])))
-    return edges
-
-
-def build_similarity_graph(train_ids: np.ndarray, similarity_edges: list[tuple[int, int, float]]) -> nx.Graph:
-    graph = nx.Graph()
-    for sid in train_ids:
-        graph.add_node(f"S{sid}", kind="Subject", sid=int(sid))
-    for a, b, cos in similarity_edges:
-        graph.add_edge(f"S{a}", f"S{b}", rel="SIMILAR_TO", weight=float(cos))
-    return graph
-
-
-def build_train_graph(
-    train_df: pd.DataFrame,
-    feature_names: list[str],
-    include_similarity: bool,
-    similarity_edges: list[tuple[int, int, float]],
-) -> nx.Graph:
-    graph = nx.Graph()
-
-    for sid in train_df["ID"].astype(int).tolist():
-        graph.add_node(f"S{sid}", kind="Subject", sid=int(sid))
-
-    feature_nodes = {}
-    property_nodes = {}
-    temporal_nodes = {}
-    behavior_nodes = {}
-
-    for feat in feature_names:
-        prop, beh, tmp = expert_mapping(feat)
-        fn = f"F|{feat}"
-        pn = f"P|{prop}"
-        tn = f"T|{tmp}"
-        bn = f"B|{beh}"
-
-        feature_nodes[feat] = fn
-        property_nodes[prop] = pn
-        temporal_nodes[tmp] = tn
-        behavior_nodes[beh] = bn
-
-        graph.add_node(fn, kind="Feature", name=feat)
-        graph.add_node(pn, kind="Property", name=prop)
-        graph.add_node(tn, kind="Temporal", name=tmp)
-        graph.add_node(bn, kind="Behavior", name=beh)
-
-        graph.add_edge(fn, pn, rel="HAS_PROPERTY", weight=1.0)
-        graph.add_edge(fn, tn, rel="HAS_TEMPORAL_PATTERN", weight=1.0)
-        graph.add_edge(pn, bn, rel="INDICATES_BEHAVIOR", weight=1.0)
-
-    for record in train_df[["ID"] + feature_names].to_dict(orient="records"):
-        sid = int(record["ID"])
-        sn = f"S{sid}"
-        for feat in feature_names:
-            val = record.get(feat)
-            if val is None or (isinstance(val, float) and math.isnan(val)):
-                continue
-            graph.add_edge(sn, feature_nodes[feat], rel="HAS_FEATURE", weight=1.0)
-
-    if include_similarity:
-        for a, b, cos in similarity_edges:
-            graph.add_edge(f"S{a}", f"S{b}", rel="SIMILAR_TO", weight=float(cos))
-
-    return graph
-
-
-def fit_node2vec(graph: nx.Graph) -> Node2Vec:
-    node2vec = Node2Vec(
-        graph,
-        dimensions=CONFIG.node2vec_dimensions,
-        walk_length=CONFIG.node2vec_walk_length,
-        num_walks=CONFIG.node2vec_num_walks,
-        p=CONFIG.node2vec_p,
-        q=CONFIG.node2vec_q,
-        workers=CONFIG.node2vec_workers,
-        seed=CONFIG.random_seed,
-        weight_key="weight",
-    )
-    return node2vec.fit(window=CONFIG.node2vec_window, min_count=1, batch_words=64, seed=CONFIG.random_seed)
-
-
-def project_test_embeddings(
-    test_matrix: np.ndarray,
-    train_matrix: np.ndarray,
-    train_embeddings: np.ndarray,
-    k: int,
+def _project_subject_embedding(
+    model: Node2Vec,
+    node_weights: list[tuple[str, float]],
+    mode: str,
 ) -> np.ndarray:
-    # Inductive projection: map test subjects onto the training embedding space
-    # via cosine-weighted kNN over training subjects only.
-    train_norm = train_matrix / (np.linalg.norm(train_matrix, axis=1) + 1e-9)[:, None]
-    test_norm = test_matrix / (np.linalg.norm(test_matrix, axis=1) + 1e-9)[:, None]
-    sims = test_norm @ train_norm.T
-
-    projected = np.zeros((test_matrix.shape[0], train_embeddings.shape[1]), dtype=float)
-    for i in range(sims.shape[0]):
-        row = sims[i]
-        k_eff = min(k, row.shape[0])
-        idx = np.argpartition(-row, k_eff - 1)[:k_eff]
-        idx = idx[np.argsort(-row[idx])]
-        weights = np.maximum(row[idx], 0.0)
-        if weights.sum() == 0:
-            weights = np.ones_like(weights) / len(weights)
-        else:
-            weights = weights / weights.sum()
-        projected[i] = np.dot(weights, train_embeddings[idx])
-    return projected
+    vectors = []
+    weights = []
+    for node, weight in node_weights:
+        if node in model.wv:
+            vectors.append(model.wv[node])
+            weights.append(weight)
+    if not vectors:
+        return np.full(model.wv.vector_size, np.nan)
+    mat = np.vstack(vectors)
+    if mode == "weighted":
+        weight_arr = np.array(weights, dtype=float)
+        weight_arr = np.where(np.isfinite(weight_arr) & (weight_arr > 0), weight_arr, 1.0)
+        return np.average(mat, axis=0, weights=weight_arr)
+    return np.mean(mat, axis=0)
 
 
-def bootstrap_auc(y_true: np.ndarray, y_score: np.ndarray, n_boot: int, seed: int) -> tuple[float, float]:
+def _summary_auc(auc_values: np.ndarray, label: str) -> dict[str, Any]:
+    mean = float(np.mean(auc_values))
+    std = float(np.std(auc_values, ddof=1)) if auc_values.size > 1 else 0.0
+    ci95 = 1.96 * std / np.sqrt(max(1, auc_values.size))
+    return {"model": label, "mean_auc": mean, "std_auc": std, "ci95": ci95}
+
+
+def _graph_kind_counts(graph: nx.Graph) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for _, data in graph.nodes(data=True):
+        kind = data.get("kind", "Unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def _sanitize_graph_weights(graph: nx.Graph, default_weight: float = 1.0) -> None:
+    for _, _, data in graph.edges(data=True):
+        weight = data.get("weight", default_weight)
+        if not np.isfinite(weight):
+            weight = default_weight
+        data["weight"] = float(weight)
+
+
+def _bootstrap_ci(values: np.ndarray, seed: int, n_boot: int = 1000) -> tuple[float, float]:
     rng = np.random.default_rng(seed)
-    n = len(y_true)
-    values = []
+    if values.size == 0:
+        return 0.0, 0.0
+    means = []
     for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        if len(np.unique(y_true[idx])) < 2:
-            continue
-        values.append(roc_auc_score(y_true[idx], y_score[idx]))
-    if not values:
-        return float("nan"), float("nan")
-    low, high = np.percentile(values, [2.5, 97.5])
-    return float(low), float(high)
+        sample = rng.choice(values, size=values.size, replace=True)
+        means.append(float(np.mean(sample)))
+    lower = float(np.percentile(means, 2.5))
+    upper = float(np.percentile(means, 97.5))
+    return lower, upper
 
 
-def proba_positive(
-    clf: LogisticRegression,
-    X: np.ndarray,
-    y_test: np.ndarray | None = None,
-    debug: bool = False,
-    tag: str = "",
-) -> np.ndarray:
-    proba = clf.predict_proba(X)
-    pos_col = list(clf.classes_).index(1)
-    if debug:
-        y_unique = set(y_test) if y_test is not None else None
-        print("classes:", clf.classes_, "pos_col:", pos_col, "y_test unique:", y_unique, "tag:", tag)
-    return proba[:, pos_col]
+def main() -> None:
+    args = parse_args()
+    rng = np.random.default_rng(args.seed)
 
+    features_df = load_csv_auto(args.features)
+    patient_df = load_csv_auto(args.patient)
 
-def orient_scores(scores: np.ndarray, invert_scores: bool) -> np.ndarray:
-    if invert_scores:
-        return 1 - scores
-    return scores
+    _print_sanity(features_df, "features")
+    _print_sanity(patient_df, "patient")
 
+    id_col_features = detect_id_column(features_df)
+    id_col_patient = detect_id_column(patient_df)
 
-def run(config: Config):
-    results_dir = Path(config.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "config_used.json").write_text(
-        json.dumps(asdict(config), indent=2, default=list),
-        encoding="utf-8",
-    )
+    features_df, patient_df = align_features_patient(features_df, patient_df, id_col_features, id_col_patient)
 
-    features = read_csv_auto(config.features_path)
-    patient = read_csv_auto(config.patient_path)
+    n_features_rows = features_df.shape[0]
+    n_patient_rows = patient_df.shape[0]
+    intersection = len(set(features_df["ID"]).intersection(set(patient_df["ID"])))
 
-    features, labels = align_inputs(features, patient, config.label_column, config.positive_label_value)
+    if intersection < 20:
+        raise ValueError(f"Intersection too small: {intersection} (<20)")
 
-    leakage_cols = {
-        config.label_column.lower(),
-        "adhd",
-        "label",
-        "class",
-        "target",
-    }
-    raw_features = read_feature_list(config.raw_feature_list)
-    raw_features = [
-        c for c in raw_features if c in features.columns and c.lower() not in leakage_cols
-    ]
-    if not raw_features:
-        raise ValueError("No raw features found in features.csv that match the feature list.")
-
-    similarity_features = read_feature_list(config.similarity_feature_list)
-    similarity_features = [
-        c for c in similarity_features if c in features.columns and c.lower() not in leakage_cols
-    ]
-    if not similarity_features:
-        raise ValueError("No similarity features found in features.csv that match the similarity feature list.")
-
-    features_full = features.copy()
-
-    features = features_full[["ID"] + raw_features].copy()
-    for col in raw_features:
-        features[col] = pd.to_numeric(features[col], errors="coerce")
-
-    similarity_df = features_full[["ID"] + similarity_features].copy()
-    for col in similarity_features:
-        similarity_df[col] = pd.to_numeric(similarity_df[col], errors="coerce")
-
-    ids = features["ID"].astype(int).to_numpy()
-    y = labels.loc[ids].to_numpy()
-
-    k_values = list(config.k_nn_values) if config.k_nn_values else [config.k_nn]
-    skf = StratifiedKFold(n_splits=config.k_folds, shuffle=True, random_state=config.random_seed)
-    class_balance = np.bincount(y, minlength=2)
     print(
-        "Hyperparameters:",
+        "Counts:",
         {
-            "node2vec_dim": config.node2vec_dimensions,
-            "node2vec_walk_length": config.node2vec_walk_length,
-            "node2vec_num_walks": config.node2vec_num_walks,
-            "node2vec_window": config.node2vec_window,
-            "node2vec_p": config.node2vec_p,
-            "node2vec_q": config.node2vec_q,
-            "k_nn_values": k_values,
-            "similarity_metric": config.similarity_metric,
-            "lr_c": config.lr_c,
-            "lr_solver": config.lr_solver,
-            "lr_max_iter": config.lr_max_iter,
-            "positive_label_value": config.positive_label_value,
-            "class_balance": class_balance.tolist(),
-            "invert_scores": config.invert_scores,
+            "n_features_rows": n_features_rows,
+            "n_patient_rows": n_patient_rows,
+            "n_intersection": intersection,
+            "n_final_aligned": features_df.shape[0],
         },
     )
 
-    per_fold_rows = []
-    pred_rows = []
+    patient_df["label"] = _normalize_label(patient_df[args.label_column], args.positive_label)
+    patient_df = patient_df.dropna(subset=["label"]).copy()
 
-    raw_importances = []
-    emb_importances = []
-    concat_importances = []
+    features_df, patient_df = align_features_patient(features_df, patient_df, "ID", "ID")
+    labels = patient_df.set_index("ID")["label"].astype(int)
 
-    random_label_aucs = []
-    debug_done = False
-    for fold, (train_idx, test_idx) in enumerate(skf.split(ids, y), start=1):
-        train_ids = ids[train_idx]
-        test_ids = ids[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    feature_list = _read_feature_list(args.feature_list)
+    features_df, feature_columns, dropped_columns = _prepare_features(features_df, "ID", feature_list)
 
-        train_df = features.iloc[train_idx].reset_index(drop=True)
-        test_df = features.iloc[test_idx].reset_index(drop=True)
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-        sim_train_df = similarity_df.iloc[train_idx].reset_index(drop=True)
-        sim_test_df = similarity_df.iloc[test_idx].reset_index(drop=True)
+    (results_dir / "splits").mkdir(exist_ok=True)
 
-        raw_imputer = SimpleImputer(strategy="median")
-        raw_scaler = StandardScaler()
-        X_raw_train = raw_imputer.fit_transform(train_df[raw_features])
-        X_raw_train = raw_scaler.fit_transform(X_raw_train)
-        X_raw_test = raw_scaler.transform(raw_imputer.transform(test_df[raw_features]))
+    with open(results_dir / "dropped_non_numeric_columns.json", "w", encoding="utf-8") as handle:
+        json.dump({"dropped_all_nan": dropped_columns}, handle, indent=2)
 
-        base_pca_dim = config.node2vec_dimensions
-        if config.pca_components is not None:
-            base_pca_dim = config.pca_components
-        pca_components = min(base_pca_dim, X_raw_train.shape[1], len(train_idx) - 1)
-        pca_components = max(pca_components, 1)
-        pca = PCA(n_components=pca_components, random_state=config.random_seed)
-        X_pca_train = pca.fit_transform(X_raw_train)
-        X_pca_test = pca.transform(X_raw_test)
-
-        sim_imputer = SimpleImputer(strategy="median")
-        sim_scaler = StandardScaler()
-        X_sim_train = sim_imputer.fit_transform(sim_train_df[similarity_features])
-        X_sim_train = sim_scaler.fit_transform(X_sim_train)
-        X_sim_test = sim_scaler.transform(sim_imputer.transform(sim_test_df[similarity_features]))
-
-        outputs = {}
-        auc_bipartite = None
-        auc_full = None
-
-        for k_value in k_values:
-            similarity_edges = build_similarity_edges(train_ids, X_sim_train, k_value)
-            for variant in ("bipartite", "subject_only", "full"):
-                if variant == "bipartite":
-                    graph = build_train_graph(train_df, raw_features, False, [])
-                elif variant == "subject_only":
-                    graph = build_similarity_graph(train_ids, similarity_edges)
-                else:
-                    graph = build_train_graph(train_df, raw_features, True, similarity_edges)
-
-                model = fit_node2vec(graph)
-
-                train_embeddings = np.vstack([model.wv[f"S{sid}"] for sid in train_ids])
-                test_embeddings = project_test_embeddings(X_sim_test, X_sim_train, train_embeddings, k_value)
-
-                emb_cols = [f"emb_{i}" for i in range(train_embeddings.shape[1])]
-
-                fold_train = pd.DataFrame(train_embeddings, columns=emb_cols)
-                fold_train.insert(0, "ID", train_ids)
-                fold_test = pd.DataFrame(test_embeddings, columns=emb_cols)
-                fold_test.insert(0, "ID", test_ids)
-
-                fold_train.to_csv(
-                    results_dir / f"embeddings_{variant}_k{k_value}_fold{fold}_train.csv", index=False
-                )
-                fold_test.to_csv(
-                    results_dir / f"embeddings_{variant}_k{k_value}_fold{fold}_test.csv", index=False
-                )
-
-                emb_imputer = SimpleImputer(strategy="median")
-                emb_scaler = StandardScaler()
-                X_emb_train = emb_scaler.fit_transform(emb_imputer.fit_transform(train_embeddings))
-                X_emb_test = emb_scaler.transform(emb_imputer.transform(test_embeddings))
-
-                outputs[(variant, k_value)] = (X_emb_train, X_emb_test, emb_cols)
-
-                lr = LogisticRegression(
-                    C=config.lr_c,
-                    solver=config.lr_solver,
-                    max_iter=config.lr_max_iter,
-                    random_state=config.random_seed,
-                )
-                lr.fit(X_emb_train, y_train)
-                prob = proba_positive(lr, X_emb_test, y_test, debug=not debug_done, tag="kg")
-                prob = orient_scores(prob, config.invert_scores)
-                debug_done = True
-                auc = roc_auc_score(y_test, prob)
-                if variant == "bipartite" and k_value == config.k_nn_values[0]:
-                    auc_bipartite = auc
-                if variant == "full" and k_value == config.k_nn_values[0]:
-                    auc_full = auc
-
-                per_fold_rows.append(
-                    {
-                        "representation": "kg",
-                        "variant": f"{variant}_k{k_value}",
-                        "fold": fold,
-                        "auc": auc,
-                    }
-                )
-                pred_rows.extend(
-                    {
-                        "ID": int(sid),
-                        "fold": fold,
-                        "y_true": int(y_true),
-                        "y_score": float(score),
-                        "representation": "kg",
-                        "variant": f"{variant}_k{k_value}",
-                    }
-                    for sid, y_true, score in zip(test_ids, y_test, prob)
-                )
-
-                if variant == "full" and k_value == config.k_nn_values[0]:
-                    perm = permutation_importance(
-                        lr,
-                        X_emb_test,
-                        y_test,
-                        scoring="roc_auc",
-                        n_repeats=config.permutation_repeats,
-                        random_state=config.random_seed,
-                        n_jobs=1,
-                    )
-                    emb_importances.append(perm.importances_mean)
-
-        lr_raw = LogisticRegression(
-            C=config.lr_c,
-            solver=config.lr_solver,
-            max_iter=config.lr_max_iter,
-            random_state=config.random_seed,
-        )
-        lr_raw.fit(X_raw_train, y_train)
-        prob_raw = proba_positive(lr_raw, X_raw_test, y_test, debug=not debug_done, tag="raw")
-        prob_raw = orient_scores(prob_raw, config.invert_scores)
-        debug_done = True
-        auc_raw = roc_auc_score(y_test, prob_raw)
-        y_train_rand = y_train.copy()
-        rng = np.random.default_rng(config.random_seed + fold)
-        rng.shuffle(y_train_rand)
-        lr_rand = LogisticRegression(
-            C=config.lr_c,
-            solver=config.lr_solver,
-            max_iter=config.lr_max_iter,
-            random_state=config.random_seed,
-        )
-        lr_rand.fit(X_raw_train, y_train_rand)
-        prob_rand = proba_positive(lr_rand, X_raw_test, y_test, debug=not debug_done, tag="random")
-        prob_rand = orient_scores(prob_rand, config.invert_scores)
-        debug_done = True
-        random_label_aucs.append(roc_auc_score(y_test, prob_rand))
-        per_fold_rows.append(
-            {
-                "representation": "raw",
-                "variant": "baseline",
-                "fold": fold,
-                "auc": auc_raw,
-            }
-        )
-        pred_rows.extend(
-            {
-                "ID": int(sid),
-                "fold": fold,
-                "y_true": int(y_true),
-                "y_score": float(score),
-                "representation": "raw",
-                "variant": "baseline",
-            }
-            for sid, y_true, score in zip(test_ids, y_test, prob_raw)
-        )
-
-        perm_raw = permutation_importance(
-            lr_raw,
-            X_raw_test,
-            y_test,
-            scoring="roc_auc",
-            n_repeats=config.permutation_repeats,
-            random_state=config.random_seed,
-            n_jobs=1,
-        )
-        raw_importances.append(perm_raw.importances_mean)
-
-        lr_pca = LogisticRegression(
-            C=config.lr_c,
-            solver=config.lr_solver,
-            max_iter=config.lr_max_iter,
-            random_state=config.random_seed,
-        )
-        lr_pca.fit(X_pca_train, y_train)
-        prob_pca = proba_positive(lr_pca, X_pca_test, y_test, debug=not debug_done, tag="pca")
-        prob_pca = orient_scores(prob_pca, config.invert_scores)
-        debug_done = True
-        auc_pca = roc_auc_score(y_test, prob_pca)
-        per_fold_rows.append(
-            {
-                "representation": "pca",
-                "variant": "baseline",
-                "fold": fold,
-                "auc": auc_pca,
-            }
-        )
-        pred_rows.extend(
-            {
-                "ID": int(sid),
-                "fold": fold,
-                "y_true": int(y_true),
-                "y_score": float(score),
-                "representation": "pca",
-                "variant": "baseline",
-            }
-            for sid, y_true, score in zip(test_ids, y_test, prob_pca)
-        )
-
-        concat_key = ("full", k_values[0])
-        X_emb_train_full, X_emb_test_full, emb_cols = outputs[concat_key]
-        X_concat_train = np.concatenate([X_raw_train, X_emb_train_full], axis=1)
-        X_concat_test = np.concatenate([X_raw_test, X_emb_test_full], axis=1)
-
-        lr_concat = LogisticRegression(
-            C=config.lr_c,
-            solver=config.lr_solver,
-            max_iter=config.lr_max_iter,
-            random_state=config.random_seed,
-        )
-        lr_concat.fit(X_concat_train, y_train)
-        prob_concat = proba_positive(lr_concat, X_concat_test, y_test, debug=not debug_done, tag="concat")
-        prob_concat = orient_scores(prob_concat, config.invert_scores)
-        debug_done = True
-        auc_concat = roc_auc_score(y_test, prob_concat)
-        per_fold_rows.append(
-            {
-                "representation": "concat",
-                "variant": f"full_k{k_values[0]}",
-                "fold": fold,
-                "auc": auc_concat,
-            }
-        )
-        pred_rows.extend(
-            {
-                "ID": int(sid),
-                "fold": fold,
-                "y_true": int(y_true),
-                "y_score": float(score),
-                "representation": "concat",
-                "variant": f"full_k{k_values[0]}",
-            }
-            for sid, y_true, score in zip(test_ids, y_test, prob_concat)
-        )
-
-        perm_concat = permutation_importance(
-            lr_concat,
-            X_concat_test,
-            y_test,
-            scoring="roc_auc",
-            n_repeats=config.permutation_repeats,
-            random_state=config.random_seed,
-            n_jobs=1,
-        )
-        concat_importances.append(perm_concat.importances_mean)
-
-        print(
-            f"Fold {fold}: raw={auc_raw:.3f} pca={auc_pca:.3f} "
-            f"kg_bipartite={auc_bipartite:.3f} kg_full={auc_full:.3f} "
-            f"concat={auc_concat:.3f}"
-        )
-
-    per_fold = pd.DataFrame(per_fold_rows)
-    per_fold.to_csv(results_dir / "auc_per_fold.csv", index=False)
-
-    predictions = pd.DataFrame(pred_rows)
-    predictions.to_csv(results_dir / "predictions.csv", index=False)
-
-    summary_rows = []
-    for (rep, variant), grp in per_fold.groupby(["representation", "variant"]):
-        mean_auc = grp["auc"].mean()
-        std_auc = grp["auc"].std()
-
-        mask = (predictions["representation"] == rep) & (predictions["variant"] == variant)
-        y_true = predictions.loc[mask, "y_true"].to_numpy()
-        y_score = predictions.loc[mask, "y_score"].to_numpy()
-        ci_low, ci_high = bootstrap_auc(y_true, y_score, config.bootstrap_samples, config.random_seed)
-
-        summary_rows.append(
-            {
-                "representation": rep,
-                "variant": variant,
-                "mean_auc": mean_auc,
-                "std_auc": std_auc,
-                "ci_low": ci_low,
-                "ci_high": ci_high,
-            }
-        )
-
-    summary = pd.DataFrame(summary_rows)
-    summary.to_csv(results_dir / "auc_summary.csv", index=False)
-
-    raw_imp = np.vstack(raw_importances)
-    raw_imp_df = pd.DataFrame(
-        {
-            "feature": raw_features,
-            "importance_mean": raw_imp.mean(axis=0),
-            "importance_std": raw_imp.std(axis=0),
-        }
-    ).sort_values("importance_mean", ascending=False)
-    raw_imp_df.to_csv(results_dir / "perm_importance_raw.csv", index=False)
-
-    emb_imp = np.vstack(emb_importances)
-    emb_cols = [f"emb_{i}" for i in range(emb_imp.shape[1])]
-    emb_imp_df = pd.DataFrame(
-        {
-            "feature": emb_cols,
-            "importance_mean": emb_imp.mean(axis=0),
-            "importance_std": emb_imp.std(axis=0),
-        }
-    ).sort_values("importance_mean", ascending=False)
-    emb_imp_df.to_csv(results_dir / "perm_importance_emb.csv", index=False)
-
-    concat_imp = np.vstack(concat_importances)
-    concat_cols = raw_features + emb_cols
-    concat_imp_df = pd.DataFrame(
-        {
-            "feature": concat_cols,
-            "importance_mean": concat_imp.mean(axis=0),
-            "importance_std": concat_imp.std(axis=0),
-        }
-    ).sort_values("importance_mean", ascending=False)
-    concat_imp_df.to_csv(results_dir / "perm_importance_concat.csv", index=False)
-
-    raw_pred = predictions[(predictions["representation"] == "raw") & (predictions["variant"] == "baseline")]
-    raw_auc = roc_auc_score(raw_pred["y_true"], raw_pred["y_score"])
-    rng = np.random.default_rng(config.random_seed)
-    shuffled = raw_pred["y_true"].to_numpy().copy()
-    rng.shuffle(shuffled)
-    shuffled_auc = roc_auc_score(shuffled, raw_pred["y_score"])
-    scores_inverted_auc = roc_auc_score(raw_pred["y_true"], 1 - raw_pred["y_score"].to_numpy())
-    labels_flipped_auc = roc_auc_score(1 - raw_pred["y_true"].to_numpy(), raw_pred["y_score"])
-
-
-    sanity = {
-        "raw_auc": float(raw_auc),
-        "shuffled_label_auc": float(shuffled_auc),
-        "scores_inverted_auc": float(scores_inverted_auc),
-        "labels_flipped_auc": float(labels_flipped_auc),
-        "random_label_auc_mean": float(np.mean(random_label_aucs)),
-        "random_label_auc_std": float(np.std(random_label_aucs)),
+    feature_columns_used: dict[str, Any] = {
+        "all_columns": feature_columns,
+        "dropped_all_nan": dropped_columns,
+        "folds": {},
     }
-    with (results_dir / "sanity_checks.json").open("w", encoding="utf-8") as handle:
-        json.dump(sanity, handle, indent=2)
 
-    print("\nSanity checks (raw baseline):")
-    print(json.dumps(sanity, indent=2))
-    if raw_auc < 0.5:
-        print(
-            "Warning: raw AUC < 0.5. Verify label encoding/positive label orientation "
-            f"(positive_label_value={config.positive_label_value})."
+    rskf = RepeatedStratifiedKFold(
+        n_splits=args.folds,
+        n_repeats=args.repeats,
+        random_state=args.seed,
+    )
+
+    auc_records = []
+    pred_records = []
+    delta_records = []
+    split_records = []
+    interaction_records = []
+
+    perm_delta_kg_sums = np.zeros(args.permutations, dtype=float)
+    perm_delta_concat_sums = np.zeros(args.permutations, dtype=float)
+    perm_auc_raw_sums = np.zeros(args.permutations, dtype=float)
+    perm_auc_kg_sums = np.zeros(args.permutations, dtype=float)
+    perm_auc_concat_sums = np.zeros(args.permutations, dtype=float)
+
+    raw_matrix = features_df.set_index("ID")[feature_columns]
+    id_list = raw_matrix.index.astype(str).tolist()
+    y_all = labels.loc[id_list].to_numpy()
+
+    for split_idx, (train_idx, test_idx) in enumerate(rskf.split(raw_matrix, y_all)):
+        repeat = split_idx // args.folds
+        fold = split_idx % args.folds
+        fold_id = f"repeat{repeat}_fold{fold}"
+
+        train_ids = [id_list[i] for i in train_idx]
+        test_ids = [id_list[i] for i in test_idx]
+
+        train_labels = y_all[train_idx]
+        test_labels = y_all[test_idx]
+
+        split_df = pd.DataFrame(
+            {
+                "train_ids": pd.Series(train_ids),
+                "test_ids": pd.Series(test_ids),
+            }
         )
-    if labels_flipped_auc > raw_auc or scores_inverted_auc > raw_auc:
-        print("Note: inverted AUC > raw AUC suggests positive-label orientation mismatch.")
-    print("\nSaved outputs to:", results_dir.resolve())
+        split_df.to_csv(results_dir / "splits" / f"split_{fold_id}.csv", index=False)
 
+        split_counts = {
+            "repeat": repeat,
+            "fold": fold,
+            "train_pos": int(train_labels.sum()),
+            "train_neg": int(len(train_labels) - train_labels.sum()),
+            "test_pos": int(test_labels.sum()),
+            "test_neg": int(len(test_labels) - test_labels.sum()),
+        }
+        split_records.append(split_counts)
+        feature_columns_used["folds"][fold_id] = feature_columns
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Leakage-free CV benchmark for raw/KG representations.")
-    parser.add_argument("--features", default=CONFIG.features_path, help="Path to features.csv")
-    parser.add_argument("--patient", default=CONFIG.patient_path, help="Path to patient_info.csv")
-    parser.add_argument("--raw-feature-list", default=CONFIG.raw_feature_list, help="Path to raw feature list")
-    parser.add_argument(
-        "--similarity-feature-list",
-        default=CONFIG.similarity_feature_list,
-        help="Path to similarity feature list",
+        train_features = raw_matrix.loc[train_ids]
+        test_features = raw_matrix.loc[test_ids]
+
+        train_patient = patient_df[patient_df["ID"].isin(train_ids)].copy()
+        test_patient = patient_df[patient_df["ID"].isin(test_ids)].copy()
+
+        train_stats = fit_train_stats(train_features.reset_index(), n_bins=args.bins)
+
+        imputed_train = _impute_dataframe(train_features, train_stats)
+        imputed_test = _impute_dataframe(test_features, train_stats)
+        imputed_train_df = imputed_train.reset_index(drop=True)
+        imputed_train_df["ID"] = train_ids
+        imputed_test_df = imputed_test.reset_index(drop=True)
+        imputed_test_df["ID"] = test_ids
+
+        scaler = StandardScaler()
+        scaled_train = scaler.fit_transform(imputed_train)
+        scaled_test = scaler.transform(imputed_test)
+
+        raw_model = LogisticRegression(
+            solver="liblinear",
+            C=args.C,
+            max_iter=5000,
+            random_state=args.seed,
+        )
+        raw_model.fit(scaled_train, train_labels)
+        prob_raw = raw_model.predict_proba(scaled_test)[:, 1]
+        auc_raw = roc_auc_score(test_labels, prob_raw)
+
+        demo_columns = _prepare_demo_columns(patient_df, "label")
+        demo_bin_edges = _demo_bin_edges(train_patient, demo_columns, args.bins)
+
+        train_corr_edges = compute_feature_correlations(imputed_train, args.corr_topk)
+
+        similarity_edges = []
+        if args.kg_variant in {"rich_with_similarity"}:
+            similarity_edges = _build_similarity_edges(train_ids, scaled_train, args.knn_k)
+
+        options = {
+            "include_bins": args.kg_variant in {"bins", "bins_corr", "bins_demo", "rich", "rich_with_similarity"},
+            "include_corr": args.kg_variant in {"bins_corr", "rich", "rich_with_similarity"},
+            "include_demo": args.kg_variant in {"bins_demo", "rich", "rich_with_similarity"},
+            "include_similarity": args.kg_variant in {"rich_with_similarity"},
+            "feature_corr_edges": train_corr_edges,
+            "similarity_edges": similarity_edges,
+            "demo_columns": demo_columns,
+            "demo_bin_edges": demo_bin_edges,
+        }
+
+        train_graph_rows = imputed_train_df.merge(
+            train_patient[["ID"] + demo_columns],
+            on="ID",
+            how="left",
+        )
+        train_graph = build_train_graph(train_graph_rows, train_stats, options)
+
+        test_graph_rows = imputed_test_df.merge(
+            test_patient[["ID"] + demo_columns],
+            on="ID",
+            how="left",
+        )
+        if args.evaluation_mode == "transductive":
+            for _, row in test_graph_rows.iterrows():
+                attach_subject_node(train_graph, row, train_stats, options, is_test=True)
+
+        _sanitize_graph_weights(train_graph)
+        kind_counts = _graph_kind_counts(train_graph)
+        print(
+            f"[Repeat {repeat} Fold {fold}] Graph nodes={train_graph.number_of_nodes()} "
+            f"edges={train_graph.number_of_edges()} kinds={kind_counts}"
+        )
+
+        n2v_model = _fit_node2vec(train_graph, args.seed + split_idx, args)
+        emb_train_df = _embedding_dataframe(n2v_model, train_ids)
+        if args.evaluation_mode == "inductive":
+            projected = []
+            for _, row in test_graph_rows.iterrows():
+                node_weights = subject_context_nodes(
+                    row,
+                    train_stats,
+                    options,
+                    weight_mode=args.projection_weight,
+                )
+                projected.append(_project_subject_embedding(n2v_model, node_weights, args.projection))
+            emb_test_df = pd.DataFrame(projected)
+            emb_test_df.insert(0, "ID", test_ids)
+        else:
+            emb_test_df = _embedding_dataframe(n2v_model, test_ids)
+
+        emb_train_path = results_dir / f"embeddings_richkg_{args.kg_variant}_fold{fold_id}_train.csv"
+        emb_test_path = results_dir / f"embeddings_richkg_{args.kg_variant}_fold{fold_id}_test.csv"
+        emb_train_df.to_csv(emb_train_path, index=False)
+        emb_test_df.to_csv(emb_test_path, index=False)
+
+        emb_train = emb_train_df.drop(columns=["ID"]).to_numpy()
+        emb_test = emb_test_df.drop(columns=["ID"]).to_numpy()
+
+        emb_scaler = StandardScaler()
+        emb_train_scaled = emb_scaler.fit_transform(emb_train)
+        emb_test_scaled = emb_scaler.transform(emb_test)
+
+        kg_model = LogisticRegression(
+            solver="liblinear",
+            C=args.C,
+            max_iter=5000,
+            random_state=args.seed,
+        )
+        kg_model.fit(emb_train_scaled, train_labels)
+        prob_kg = kg_model.predict_proba(emb_test_scaled)[:, 1]
+        auc_kg = roc_auc_score(test_labels, prob_kg)
+
+        concat_train = np.hstack([scaled_train, emb_train_scaled])
+        concat_test = np.hstack([scaled_test, emb_test_scaled])
+
+        concat_model = LogisticRegression(
+            solver="liblinear",
+            C=args.C,
+            max_iter=5000,
+            random_state=args.seed,
+        )
+        concat_model.fit(concat_train, train_labels)
+        prob_concat = concat_model.predict_proba(concat_test)[:, 1]
+        auc_concat = roc_auc_score(test_labels, prob_concat)
+
+        auc_records.append(
+            {
+                "repeat": repeat,
+                "fold": fold,
+                "auc_raw": auc_raw,
+                "auc_kg": auc_kg,
+                "auc_concat": auc_concat,
+            }
+        )
+
+        pred_records.append(
+            pd.DataFrame(
+                {
+                    "id": test_ids,
+                    "y_true": test_labels,
+                    "prob_raw": prob_raw,
+                    "prob_kg": prob_kg,
+                    "prob_concat": prob_concat,
+                    "fold": fold,
+                    "repeat": repeat,
+                }
+            )
+        )
+
+        delta_records.append(
+            {
+                "repeat": repeat,
+                "fold": fold,
+                "delta_kg": auc_kg - auc_raw,
+                "delta_concat": auc_concat - auc_raw,
+            }
+        )
+
+        entropy_cols = _select_entropy_features(feature_columns)
+        variance_cols = _select_variance_features(feature_columns)
+        entropy_train_scores = _aggregate_subject_score(imputed_train, entropy_cols)
+        variance_train_scores = _aggregate_subject_score(imputed_train, variance_cols)
+
+        subgroup_definitions: list[tuple[str, pd.Series, pd.Series]] = []
+        if not entropy_train_scores.empty:
+            entropy_threshold = float(np.nanmedian(entropy_train_scores))
+            entropy_test_scores = _aggregate_subject_score(imputed_test, entropy_cols)
+            entropy_group = (entropy_test_scores >= entropy_threshold).map(
+                {True: "high_entropy", False: "low_entropy"}
+            )
+            subgroup_definitions.append(("entropy", entropy_group, entropy_test_scores))
+
+        if not variance_train_scores.empty:
+            variance_threshold = float(np.nanmedian(variance_train_scores))
+            variance_test_scores = _aggregate_subject_score(imputed_test, variance_cols)
+            variance_group = (variance_test_scores >= variance_threshold).map(
+                {True: "high_variance", False: "low_variance"}
+            )
+            subgroup_definitions.append(("variance", variance_group, variance_test_scores))
+
+        med_flags = _medication_flags(test_patient)
+        med_group = med_flags.reindex(test_ids).fillna(0).map({1: "medication", 0: "no_medication"})
+        subgroup_definitions.append(("medication", med_group, med_flags.reindex(test_ids)))
+
+        for subgroup_name, subgroup_labels, subgroup_scores in subgroup_definitions:
+            for level in subgroup_labels.dropna().unique():
+                mask = subgroup_labels == level
+                if mask.sum() < 10:
+                    continue
+                y_sub = test_labels[mask.to_numpy()]
+                if len(np.unique(y_sub)) < 2:
+                    continue
+                prob_raw_sub = np.array(prob_raw)[mask.to_numpy()]
+                prob_concat_sub = np.array(prob_concat)[mask.to_numpy()]
+                auc_raw_sub = roc_auc_score(y_sub, prob_raw_sub)
+                auc_concat_sub = roc_auc_score(y_sub, prob_concat_sub)
+                interaction_records.append(
+                    {
+                        "repeat": repeat,
+                        "fold": fold,
+                        "subgroup": subgroup_name,
+                        "level": level,
+                        "n": int(mask.sum()),
+                        "pos": int(y_sub.sum()),
+                        "neg": int(len(y_sub) - y_sub.sum()),
+                        "auc_raw": auc_raw_sub,
+                        "auc_concat": auc_concat_sub,
+                        "delta_concat": auc_concat_sub - auc_raw_sub,
+                    }
+                )
+
+        for perm_idx in range(args.permutations):
+            perm_train = rng.permutation(train_labels)
+            perm_test = rng.permutation(test_labels)
+
+            raw_model.fit(scaled_train, perm_train)
+            perm_prob_raw = raw_model.predict_proba(scaled_test)[:, 1]
+            perm_auc_raw = roc_auc_score(perm_test, perm_prob_raw)
+
+            kg_model.fit(emb_train_scaled, perm_train)
+            perm_prob_kg = kg_model.predict_proba(emb_test_scaled)[:, 1]
+            perm_auc_kg = roc_auc_score(perm_test, perm_prob_kg)
+
+            concat_model.fit(concat_train, perm_train)
+            perm_prob_concat = concat_model.predict_proba(concat_test)[:, 1]
+            perm_auc_concat = roc_auc_score(perm_test, perm_prob_concat)
+
+            perm_delta_kg_sums[perm_idx] += perm_auc_kg - perm_auc_raw
+            perm_delta_concat_sums[perm_idx] += perm_auc_concat - perm_auc_raw
+            perm_auc_raw_sums[perm_idx] += perm_auc_raw
+            perm_auc_kg_sums[perm_idx] += perm_auc_kg
+            perm_auc_concat_sums[perm_idx] += perm_auc_concat
+
+        print(f"[Repeat {repeat} Fold {fold}] AUC raw={auc_raw:.3f} kg={auc_kg:.3f} concat={auc_concat:.3f}")
+        print(f"[Repeat {repeat} Fold {fold}] class counts {split_counts}")
+
+    auc_df = pd.DataFrame(auc_records)
+    auc_df.to_csv(results_dir / "auc_per_fold.csv", index=False)
+
+    preds_df = pd.concat(pred_records, ignore_index=True)
+    preds_df.to_csv(results_dir / "predictions_all.csv", index=False)
+
+    delta_df = pd.DataFrame(delta_records)
+    delta_df.to_csv(results_dir / "delta_per_fold.csv", index=False)
+
+    split_df = pd.DataFrame(split_records)
+    split_df.to_csv(results_dir / "splits_summary.csv", index=False)
+
+    if interaction_records:
+        interaction_df = pd.DataFrame(interaction_records)
+        interaction_df.to_csv(results_dir / "interaction_analysis.csv", index=False)
+        summary_rows = (
+            interaction_df.groupby(["subgroup", "level"])
+            .agg(
+                mean_delta=("delta_concat", "mean"),
+                std_delta=("delta_concat", "std"),
+                mean_auc_raw=("auc_raw", "mean"),
+                mean_auc_concat=("auc_concat", "mean"),
+                n=("n", "sum"),
+                pos=("pos", "sum"),
+                neg=("neg", "sum"),
+            )
+            .reset_index()
+        )
+        summary_rows.to_csv(results_dir / "interaction_analysis_summary.csv", index=False)
+
+    auc_summary = pd.DataFrame(
+        [
+            _summary_auc(auc_df["auc_raw"].to_numpy(), "raw"),
+            _summary_auc(auc_df["auc_kg"].to_numpy(), "kg"),
+            _summary_auc(auc_df["auc_concat"].to_numpy(), "concat"),
+        ]
     )
-    parser.add_argument("--results-dir", default=CONFIG.results_dir, help="Output directory for results")
-    parser.add_argument(
-        "--k-values",
-        default=",".join(str(k) for k in CONFIG.k_nn_values),
-        help="Comma-separated list of k values for kNN sensitivity (e.g., 3,5,10).",
+    auc_summary.to_csv(results_dir / "auc_summary.csv", index=False)
+
+    delta_kg = delta_df["delta_kg"].to_numpy()
+    delta_concat = delta_df["delta_concat"].to_numpy()
+    delta_kg_ci = _bootstrap_ci(delta_kg, args.seed)
+    delta_concat_ci = _bootstrap_ci(delta_concat, args.seed + 1)
+    delta_summary = pd.DataFrame(
+        [
+            {
+                "metric": "delta_kg",
+                "mean": float(np.mean(delta_kg)),
+                "std": float(np.std(delta_kg, ddof=1)) if delta_kg.size > 1 else 0.0,
+                "ci_low": delta_kg_ci[0],
+                "ci_high": delta_kg_ci[1],
+            },
+            {
+                "metric": "delta_concat",
+                "mean": float(np.mean(delta_concat)),
+                "std": float(np.std(delta_concat, ddof=1)) if delta_concat.size > 1 else 0.0,
+                "ci_low": delta_concat_ci[0],
+                "ci_high": delta_concat_ci[1],
+            },
+        ]
     )
-    parser.add_argument("--label-column", default=CONFIG.label_column, help="Label column in patient_info.csv")
-    parser.add_argument(
-        "--positive-label",
-        default=CONFIG.positive_label_value,
-        help="Value treated as positive class (mapped to 1). Accepts numbers or strings like 'A'/'T'.",
-    )
-    parser.add_argument(
-        "--invert-scores",
-        action="store_true",
-        help="Invert predicted scores (1 - score) for all representations.",
-    )
-    return parser.parse_args()
+    delta_summary.to_csv(results_dir / "delta_summary.csv", index=False)
+
+    observed_delta_kg = float(np.mean(delta_kg))
+    observed_delta_concat = float(np.mean(delta_concat))
+    split_count = len(delta_records)
+    perm_mean_delta_kg = perm_delta_kg_sums / max(1, split_count)
+    perm_mean_delta_concat = perm_delta_concat_sums / max(1, split_count)
+    perm_mean_auc_raw = perm_auc_raw_sums / max(1, split_count)
+    perm_mean_auc_kg = perm_auc_kg_sums / max(1, split_count)
+    perm_mean_auc_concat = perm_auc_concat_sums / max(1, split_count)
+    pval_kg = float(np.mean(perm_mean_delta_kg >= observed_delta_kg))
+    pval_concat = float(np.mean(perm_mean_delta_concat >= observed_delta_concat))
+
+    permutation_summary = {
+        "observed_delta_kg": observed_delta_kg,
+        "observed_delta_concat": observed_delta_concat,
+        "p_value_kg": pval_kg,
+        "p_value_concat": pval_concat,
+        "permutations": args.permutations,
+        "perm_mean_auc_raw_mean": float(np.mean(perm_mean_auc_raw)),
+        "perm_mean_auc_kg_mean": float(np.mean(perm_mean_auc_kg)),
+        "perm_mean_auc_concat_mean": float(np.mean(perm_mean_auc_concat)),
+    }
+    with open(results_dir / "permutation_test_delta.json", "w", encoding="utf-8") as handle:
+        json.dump(permutation_summary, handle, indent=2)
+
+    if abs(float(np.mean(perm_mean_delta_kg))) > 0.05 or abs(float(np.mean(perm_mean_delta_concat))) > 0.05:
+        print("WARNING: permutation deltas are not centered near 0. Check leakage or setup.")
+    if (
+        abs(float(np.mean(perm_mean_auc_raw)) - 0.5) > 0.05
+        or abs(float(np.mean(perm_mean_auc_kg)) - 0.5) > 0.05
+        or abs(float(np.mean(perm_mean_auc_concat)) - 0.5) > 0.05
+    ):
+        print("WARNING: permutation AUCs are far from 0.5. Check leakage or setup.")
+
+    config_payload = {
+        "args": vars(args),
+        "feature_columns_used": feature_columns,
+        "feature_list_path": args.feature_list,
+        "dropped_all_nan": dropped_columns,
+    }
+    with open(results_dir / "config_used.json", "w", encoding="utf-8") as handle:
+        json.dump(config_payload, handle, indent=2)
+
+    with open(results_dir / "feature_columns_used.json", "w", encoding="utf-8") as handle:
+        json.dump(feature_columns_used, handle, indent=2)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    k_values = tuple(int(x) for x in args.k_values.split(",") if x.strip())
-    run(
-        Config(
-            features_path=args.features,
-            patient_path=args.patient,
-            raw_feature_list=args.raw_feature_list,
-            similarity_feature_list=args.similarity_feature_list,
-            label_column=args.label_column,
-            positive_label_value=args.positive_label,
-            invert_scores=args.invert_scores,
-            results_dir=args.results_dir,
-            random_seed=CONFIG.random_seed,
-            k_folds=CONFIG.k_folds,
-            k_nn=CONFIG.k_nn,
-            k_nn_values=k_values,
-            node2vec_dimensions=CONFIG.node2vec_dimensions,
-            node2vec_walk_length=CONFIG.node2vec_walk_length,
-            node2vec_num_walks=CONFIG.node2vec_num_walks,
-            node2vec_window=CONFIG.node2vec_window,
-            node2vec_p=CONFIG.node2vec_p,
-            node2vec_q=CONFIG.node2vec_q,
-            node2vec_workers=CONFIG.node2vec_workers,
-            lr_c=CONFIG.lr_c,
-            lr_solver=CONFIG.lr_solver,
-            lr_max_iter=CONFIG.lr_max_iter,
-            pca_components=CONFIG.pca_components,
-            permutation_repeats=CONFIG.permutation_repeats,
-            bootstrap_samples=CONFIG.bootstrap_samples,
-            similarity_metric=CONFIG.similarity_metric,
-        )
-    )
+    main()
