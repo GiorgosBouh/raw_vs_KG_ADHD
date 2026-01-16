@@ -114,21 +114,32 @@ def _prepare_features(
     features_df: pd.DataFrame,
     id_column: str,
     feature_list: list[str] | None,
-) -> tuple[pd.DataFrame, list[str], list[str]]:
+) -> tuple[pd.DataFrame, list[str], list[str], int, int]:
     features = features_df.copy()
     features["ID"] = features[id_column].astype(str)
     feature_cols = [c for c in features.columns if c != id_column and c != "ID"]
+    n_total_before_filter = len(feature_cols)
     if feature_list is not None:
         selected = [c for c in feature_cols if c in feature_list]
         if not selected:
             raise ValueError("No raw features found that match the provided feature list.")
         feature_cols = selected
+    n_after_featurelist_before_drop = len(feature_cols)
+    features = features[["ID"] + feature_cols].copy()
     features[feature_cols] = features[feature_cols].apply(pd.to_numeric, errors="coerce")
+    features[feature_cols] = features[feature_cols].replace([np.inf, -np.inf], np.nan)
     dropped = [c for c in feature_cols if features[c].isna().all()]
+    used_feature_cols = [c for c in feature_cols if c not in dropped]
     if dropped:
         features = features.drop(columns=dropped)
-    final_cols = [c for c in features.columns if c != "ID"]
-    return features, final_cols, dropped
+    final_cols = used_feature_cols
+    return (
+        features,
+        final_cols,
+        dropped,
+        n_total_before_filter,
+        n_after_featurelist_before_drop,
+    )
 
 
 def _impute_dataframe(df: pd.DataFrame, stats: TrainStats | None = None) -> pd.DataFrame:
@@ -136,12 +147,13 @@ def _impute_dataframe(df: pd.DataFrame, stats: TrainStats | None = None) -> pd.D
         imputer = SimpleImputer(strategy="median")
         imputed = imputer.fit_transform(df)
         return pd.DataFrame(imputed, columns=df.columns, index=df.index)
-    values = df.copy()
+    values = df.replace([np.inf, -np.inf], np.nan).copy()
     for col in df.columns:
         median = stats.medians.get(col, np.nan)
         if not np.isfinite(median):
             median = 0.0
         values[col] = values[col].fillna(median)
+    values = values.replace([np.inf, -np.inf], 0.0)
     return values
 
 
@@ -347,7 +359,13 @@ def main() -> None:
     labels = patient_df.set_index("ID")["label"].astype(int)
 
     feature_list = _read_feature_list(args.feature_list)
-    features_df, feature_columns, dropped_columns = _prepare_features(features_df, "ID", feature_list)
+    (
+        features_df,
+        used_feature_columns,
+        dropped_columns,
+        n_total_before_filter,
+        n_after_featurelist_before_drop,
+    ) = _prepare_features(features_df, "ID", feature_list)
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -358,8 +376,11 @@ def main() -> None:
         json.dump({"dropped_all_nan": dropped_columns}, handle, indent=2)
 
     feature_columns_used: dict[str, Any] = {
-        "all_columns": feature_columns,
+        "all_columns": used_feature_columns,
         "dropped_all_nan": dropped_columns,
+        "n_features_used": len(used_feature_columns),
+        "n_features_total_before_filter": n_total_before_filter,
+        "n_features_after_featurelist_before_drop": n_after_featurelist_before_drop,
         "folds": {},
     }
 
@@ -381,9 +402,14 @@ def main() -> None:
     perm_auc_kg_sums = np.zeros(args.permutations, dtype=float)
     perm_auc_concat_sums = np.zeros(args.permutations, dtype=float)
 
-    raw_matrix = features_df.set_index("ID")[feature_columns]
+    raw_matrix = features_df.set_index("ID")[used_feature_columns]
     id_list = raw_matrix.index.astype(str).tolist()
     y_all = labels.loc[id_list].to_numpy()
+
+    if feature_list is not None:
+        print(f"Using {len(used_feature_columns)} features (feature-list: {args.feature_list})")
+    else:
+        print(f"Using ALL features (N={len(used_feature_columns)}) (no feature-list)")
 
     for split_idx, (train_idx, test_idx) in enumerate(rskf.split(raw_matrix, y_all)):
         repeat = split_idx // args.folds
@@ -413,7 +439,7 @@ def main() -> None:
             "test_neg": int(len(test_labels) - test_labels.sum()),
         }
         split_records.append(split_counts)
-        feature_columns_used["folds"][fold_id] = feature_columns
+        feature_columns_used["folds"][fold_id] = used_feature_columns
 
         train_features = raw_matrix.loc[train_ids]
         test_features = raw_matrix.loc[test_ids]
@@ -470,6 +496,15 @@ def main() -> None:
             how="left",
         )
         train_graph = build_train_graph(train_graph_rows, train_stats, options)
+        if feature_list is not None:
+            feature_node_count = sum(
+                1 for _, data in train_graph.nodes(data=True) if data.get("kind") == "Feature"
+            )
+            if feature_node_count != len(used_feature_columns):
+                raise ValueError(
+                    "Feature-list mismatch: expected "
+                    f"{len(used_feature_columns)} Feature nodes, found {feature_node_count}."
+                )
 
         test_graph_rows = imputed_test_df.merge(
             test_patient[["ID"] + demo_columns],
@@ -572,8 +607,8 @@ def main() -> None:
             }
         )
 
-        entropy_cols = _select_entropy_features(feature_columns)
-        variance_cols = _select_variance_features(feature_columns)
+        entropy_cols = _select_entropy_features(used_feature_columns)
+        variance_cols = _select_variance_features(used_feature_columns)
         entropy_train_scores = _aggregate_subject_score(imputed_train, entropy_cols)
         variance_train_scores = _aggregate_subject_score(imputed_train, variance_cols)
 
@@ -748,9 +783,12 @@ def main() -> None:
 
     config_payload = {
         "args": vars(args),
-        "feature_columns_used": feature_columns,
+        "feature_columns_used": used_feature_columns,
         "feature_list_path": args.feature_list,
         "dropped_all_nan": dropped_columns,
+        "n_features_used": len(used_feature_columns),
+        "n_features_total_before_filter": n_total_before_filter,
+        "n_features_after_featurelist_before_drop": n_after_featurelist_before_drop,
     }
     with open(results_dir / "config_used.json", "w", encoding="utf-8") as handle:
         json.dump(config_payload, handle, indent=2)
