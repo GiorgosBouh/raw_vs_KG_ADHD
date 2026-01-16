@@ -114,29 +114,33 @@ def _prepare_features(
     features_df: pd.DataFrame,
     id_column: str,
     feature_list: list[str] | None,
-) -> tuple[pd.DataFrame, list[str], list[str], int, int]:
+) -> tuple[pd.DataFrame, list[str], list[str], int, int, int]:
     features = features_df.copy()
     features["ID"] = features[id_column].astype(str)
     feature_cols = [c for c in features.columns if c != id_column and c != "ID"]
     n_total_before_filter = len(feature_cols)
+    feature_list_len = len(feature_list) if feature_list is not None else 0
     if feature_list is not None:
         selected = [c for c in feature_cols if c in feature_list]
         if not selected:
             raise ValueError("No raw features found that match the provided feature list.")
         feature_cols = selected
     n_after_featurelist_before_drop = len(feature_cols)
+    features = features[["ID"] + feature_cols].copy()
     features[feature_cols] = features[feature_cols].apply(pd.to_numeric, errors="coerce")
     features[feature_cols] = features[feature_cols].replace([np.inf, -np.inf], np.nan)
     dropped = [c for c in feature_cols if features[c].isna().all()]
+    used_feature_cols = [c for c in feature_cols if c not in dropped]
     if dropped:
         features = features.drop(columns=dropped)
-    final_cols = [c for c in features.columns if c != "ID"]
+    final_cols = used_feature_cols
     return (
         features,
         final_cols,
         dropped,
         n_total_before_filter,
         n_after_featurelist_before_drop,
+        feature_list_len,
     )
 
 
@@ -363,6 +367,7 @@ def main() -> None:
         dropped_columns,
         n_total_before_filter,
         n_after_featurelist_before_drop,
+        feature_list_len,
     ) = _prepare_features(features_df, "ID", feature_list)
 
     results_dir = Path(args.results_dir)
@@ -379,6 +384,7 @@ def main() -> None:
         "n_features_used": len(used_feature_columns),
         "n_features_total_before_filter": n_total_before_filter,
         "n_features_after_featurelist_before_drop": n_after_featurelist_before_drop,
+        "feature_list_len": feature_list_len,
         "folds": {},
     }
 
@@ -405,7 +411,17 @@ def main() -> None:
     y_all = labels.loc[id_list].to_numpy()
 
     if feature_list is not None:
-        print(f"Using {len(used_feature_columns)} features (feature-list: {args.feature_list})")
+        print(
+            "Using "
+            f"{len(used_feature_columns)} features (feature-list: {args.feature_list}, "
+            f"feature-list entries: {feature_list_len}, "
+            f"intersection before drop: {n_after_featurelist_before_drop})"
+        )
+        if feature_list_len < n_total_before_filter and n_after_featurelist_before_drop == n_total_before_filter:
+            raise ValueError(
+                "Feature-list filtering did not reduce columns. "
+                "Check that feature names match features.csv exactly."
+            )
     else:
         print(f"Using ALL features (N={len(used_feature_columns)}) (no feature-list)")
 
@@ -605,8 +621,8 @@ def main() -> None:
             }
         )
 
-        entropy_cols = _select_entropy_features(feature_columns)
-        variance_cols = _select_variance_features(feature_columns)
+        entropy_cols = _select_entropy_features(used_feature_columns)
+        variance_cols = _select_variance_features(used_feature_columns)
         entropy_train_scores = _aggregate_subject_score(imputed_train, entropy_cols)
         variance_train_scores = _aggregate_subject_score(imputed_train, variance_cols)
 
@@ -787,6 +803,7 @@ def main() -> None:
         "n_features_used": len(used_feature_columns),
         "n_features_total_before_filter": n_total_before_filter,
         "n_features_after_featurelist_before_drop": n_after_featurelist_before_drop,
+        "feature_list_len": feature_list_len,
     }
     with open(results_dir / "config_used.json", "w", encoding="utf-8") as handle:
         json.dump(config_payload, handle, indent=2)
